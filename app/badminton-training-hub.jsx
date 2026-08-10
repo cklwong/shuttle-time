@@ -1,0 +1,1777 @@
+import React, { useState, useEffect, useMemo } from "react";
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  LineChart, Line, CartesianGrid, Legend,
+} from "recharts";
+
+/* ------------------------------------------------------------------ */
+/* Constants                                                           */
+/* ------------------------------------------------------------------ */
+
+const STORE_KEY = "badminton:data:v1";
+
+/* --- AI helpers ---------------------------------------------------- */
+
+async function directClaude(prompt) {
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch (e) {
+    throw new Error("Network error reaching the AI (" + e.message + ")");
+  }
+  let out;
+  try { out = await res.json(); } catch (e) {
+    throw new Error("Unreadable AI response (HTTP " + res.status + ")");
+  }
+  if (out && out.type === "error") throw new Error(out.error?.message || "API error");
+  if (out && out.error) throw new Error(out.error.message || JSON.stringify(out.error));
+  const text = (out.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+  if (!text) throw new Error("The AI returned an empty response (HTTP " + res.status + ")");
+  return { text, truncated: out.stop_reason === "max_tokens" };
+}
+
+async function callClaude(prompt) {
+  let lastErr;
+  for (let i = 0; i < 2; i++) {
+    try { return await directClaude(prompt); }
+    catch (e) {
+      lastErr = e;
+      if (!/Network error/.test(e.message)) break; // real API errors: don't retry
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  }
+  throw lastErr;
+}
+
+// Parse JSON from model output; if the output was cut off mid-object,
+// trim to the last complete value and close any open strings/brackets.
+function parseJsonLoose(raw) {
+  const clean = raw.replace(/```json|```/g, "").trim();
+  const start = clean.indexOf("{");
+  if (start < 0) throw new Error("No JSON found in the AI response");
+  const end = clean.lastIndexOf("}");
+  if (end > start) {
+    try { return JSON.parse(clean.slice(start, end + 1)); } catch (e) { /* fall through to repair */ }
+  }
+  let s = clean.slice(start);
+  const lastGood = Math.max(s.lastIndexOf("}"), s.lastIndexOf("]"), s.lastIndexOf('"'));
+  if (lastGood > 0) s = s.slice(0, lastGood + 1);
+  s = s.replace(/,\s*$/, "");
+  const opens = [];
+  let inStr = false, esc = false;
+  for (const ch of s) {
+    if (esc) { esc = false; continue; }
+    if (ch === "\\") { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === "{" || ch === "[") opens.push(ch);
+    else if (ch === "}" || ch === "]") opens.pop();
+  }
+  if (inStr) s += '"';
+  s = s.replace(/,\s*$/, "");
+  while (opens.length) s += opens.pop() === "{" ? "}" : "]";
+  try { return JSON.parse(s); } catch (e) {
+    throw new Error("Couldn't parse the AI's response as JSON");
+  }
+}
+
+const CATEGORIES = [
+  "Upper body strength", "Lower body strength", "Core", "Power",
+  "Speed", "Agility", "Cardio",
+  "On-court footwork", "Front court strokes", "Mid-court / drives",
+  "Back court strokes", "Serve & return", "Combo drills",
+];
+
+const SESSION_TYPES = [
+  "Strength & conditioning",
+  "Footwork drills",
+  "Multi-shuttle drills",
+  "Single shuttle rally",
+  "Running",
+  "Mixed",
+];
+
+const TYPE_SHORT = {
+  "Strength & conditioning": "S&C",
+  "Footwork drills": "Footwork",
+  "Multi-shuttle drills": "Multi-shuttle",
+  "Single shuttle rally": "Rally",
+  "Running": "Run",
+  "Mixed": "Mixed",
+};
+
+const PLAYER_COLORS = ["#4A90D9", "#2FA36B", "#D96A44", "#8E6BC8", "#E2B93B", "#D94A6A", "#3BB8C4"];
+
+const SEED_VERSION = 3;
+
+const SEED_EXERCISES = [
+  { name: "Push-up ladder", type: "Strength & conditioning", categories: ["Upper body strength", "Core"], desc: "Sets of 5-10-15 push-ups with 30s rest between sets." },
+  { name: "Medicine ball overhead throws", type: "Strength & conditioning", categories: ["Upper body strength", "Power"], desc: "Simulates smash motion. 3 sets of 10 throws against a wall." },
+  { name: "Medicine ball rotational throws", type: "Strength & conditioning", categories: ["Core", "Power"], desc: "Side throws against a wall, 8 each side x 3 sets — drives smash rotation." },
+  { name: "Squat jumps", type: "Strength & conditioning", categories: ["Lower body strength", "Power"], desc: "3 sets of 12. Land soft, explode up." },
+  { name: "Box jumps", type: "Strength & conditioning", categories: ["Power", "Lower body strength"], desc: "3 sets of 8 onto a stable box or step. Full hip extension, soft landing." },
+  { name: "Lunge matrix", type: "Strength & conditioning", categories: ["Lower body strength", "On-court footwork"], desc: "Forward, lateral, and reverse lunges — 8 per leg per direction. Mirrors on-court lunging." },
+  { name: "Calf raises & ankle hops", type: "Strength & conditioning", categories: ["Lower body strength", "Power"], desc: "15 slow calf raises, then 20 quick low ankle hops. 3 rounds — protects ankles, adds spring." },
+  { name: "Plank circuit", type: "Strength & conditioning", categories: ["Core"], desc: "Front plank 45s, side planks 30s each side, rest 30s. 3 rounds." },
+  { name: "Band shoulder rotations", type: "Strength & conditioning", categories: ["Upper body strength"], desc: "External/internal rotations with a light band, 12 each way x 2. Smash-shoulder injury prevention." },
+  { name: "Skipping rope intervals", type: "Strength & conditioning", categories: ["Cardio", "Speed"], desc: "45s fast / 15s rest x 10 rounds." },
+  { name: "Burpee intervals", type: "Strength & conditioning", categories: ["Cardio", "Power"], desc: "30s burpees / 30s rest x 8 rounds." },
+  { name: "Court shuttle runs", type: "Strength & conditioning", categories: ["Cardio", "Speed"], desc: "Baseline-to-net repeats, touch each line. 6 runs, rest 45s, x 3 sets." },
+  { name: "Ladder drills", type: "Strength & conditioning", categories: ["Agility", "Speed"], desc: "In-in-out-out, lateral shuffles, icky shuffle. 2 passes each pattern." },
+  { name: "6-corner footwork", type: "Footwork drills", categories: ["On-court footwork", "Agility", "Cardio"], desc: "Shadow all 6 corners from base. 30s on / 30s off x 8." },
+  { name: "4-corner pointing drill", type: "Footwork drills", categories: ["On-court footwork", "Speed"], desc: "Coach points, player moves with lunge and recovery. 45s rounds." },
+  { name: "Split-step timing", type: "Footwork drills", categories: ["Agility", "On-court footwork"], desc: "Partner claps or points on random timing; player split-steps and explodes into the first step. 45s x 6." },
+  { name: "Shadow smash & recover", type: "Footwork drills", categories: ["On-court footwork", "Back court strokes"], desc: "Chassé to rear court, jump-smash shadow, recover to base. 10 reps x 4 sets each side." },
+  { name: "Front-court net shuffle", type: "Footwork drills", categories: ["On-court footwork", "Front court strokes"], desc: "Side-to-side net coverage with split step and lunge." },
+  { name: "Multi-shuttle net kills", type: "Multi-shuttle drills", categories: ["Front court strokes", "Speed"], desc: "Feeder throws loose shots at the net, player kills. 20 shuttles x 3 sets." },
+  { name: "Multi-shuttle lift accuracy", type: "Multi-shuttle drills", categories: ["Front court strokes", "Serve & return"], desc: "Feeds to the net; lift to rear-court targets (cones in the tramline corners). 20 shuttles x 3." },
+  { name: "Multi-shuttle clears & drops", type: "Multi-shuttle drills", categories: ["Back court strokes", "Combo drills"], desc: "Alternate clear and drop from rear court. 30 shuttles x 3 sets." },
+  { name: "Multi-shuttle smash endurance", type: "Multi-shuttle drills", categories: ["Back court strokes", "Power", "Cardio"], desc: "Continuous feeds to rear court, full smashes. 15 shuttles x 4 sets, rest 60s." },
+  { name: "Multi-shuttle drive exchanges", type: "Multi-shuttle drills", categories: ["Mid-court / drives", "Speed"], desc: "Flat fast feeds at chest height, alternate forehand/backhand drives. 20 x 3." },
+  { name: "Multi-shuttle defense", type: "Multi-shuttle drills", categories: ["Mid-court / drives", "Speed"], desc: "Fast feeds to body and both sides, block or drive back. 20 shuttles x 4 sets." },
+  { name: "Random 6-corner multi-shuttle", type: "Multi-shuttle drills", categories: ["Combo drills", "On-court footwork", "Cardio"], desc: "Feeder sends shuttles to random corners; play the right shot and recover to base. 12 shuttles x 4." },
+  { name: "Clear-drop-net rally", type: "Single shuttle rally", categories: ["Combo drills", "Back court strokes", "Front court strokes"], desc: "Fixed pattern rally: clear, drop, net, lift. Keep the shuttle going." },
+  { name: "Attack vs defense half-court", type: "Single shuttle rally", categories: ["Combo drills", "Back court strokes", "Mid-court / drives"], desc: "One attacks (smash/drop), one defends (lift/block). Swap roles every 3 min. 4 rounds." },
+  { name: "Half-court singles rally", type: "Single shuttle rally", categories: ["Cardio", "Combo drills"], desc: "Continuous half-court rally, aim for 20+ shot rallies." },
+  { name: "Serve & return practice", type: "Single shuttle rally", categories: ["Serve & return", "Front court strokes"], desc: "Low serve accuracy to targets, partner practices return." },
+  { name: "High serve accuracy", type: "Single shuttle rally", categories: ["Serve & return"], desc: "High serves to a towel target in the rear tramlines. 20 serves each, count the hits, then swap." },
+  { name: "Easy run", type: "Running", categories: ["Cardio"], desc: "30-45 min at conversational pace. Aerobic base — should feel comfortable the whole way." },
+  { name: "Tempo run", type: "Running", categories: ["Cardio"], desc: "10 min easy, 15-20 min comfortably hard (can speak short sentences), 5 min easy." },
+  { name: "Interval run 400m repeats", type: "Running", categories: ["Cardio", "Speed"], desc: "6-8 x 400m fast with 90s jog recovery. Matches badminton's stop-start energy demands." },
+  { name: "Hill sprints", type: "Running", categories: ["Power", "Speed", "Cardio"], desc: "8-10 x 15-20s uphill sprints, walk-down recovery. Leg drive and acceleration." },
+];
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+const DEFAULT_DATA = {
+  players: [
+    { id: "p1", name: "Devon", color: "#4A90D9" },
+    { id: "p2", name: "Eden", color: "#2FA36B" },
+  ],
+  exercises: SEED_EXERCISES.map((e) => ({ id: uid(), ...e })),
+  sessions: [],
+  tournament: { name: "Next tournament", date: "" },
+  settings: { coachPin: "" },
+  seedVersion: SEED_VERSION,
+  updatedAt: 0,
+};
+
+const normalize = (d) => {
+  const base = {
+    ...DEFAULT_DATA,
+    ...d,
+    players: d.players && d.players.length ? d.players : DEFAULT_DATA.players,
+    tournament: { name: "Next tournament", date: "", ...(d.tournament || {}) },
+    settings: { coachPin: "", ...(d.settings || {}) },
+    updatedAt: d.updatedAt || 0,
+  };
+  // One-time rename: players still carrying default names get their real names
+  // (and theme-matched colors). Names already customized in the app are untouched.
+  base.players = (base.players || []).map((p) => {
+    if (p.id === "p1" && p.name === "Player 1") return { ...p, name: "Devon", color: "#4A90D9" };
+    if (p.id === "p2" && p.name === "Player 2") return { ...p, name: "Eden", color: "#2FA36B" };
+    if (p.id === "p2" && p.name === "Eden" && p.color === "#D96A44") return { ...p, color: "#2FA36B" }; // Eden wants green
+    return p;
+  });
+  // One-time merge: when the starter bank grows, add any exercises the saved
+  // data doesn't have yet (matched by name, so edits and deletions afterwards stick).
+  if ((d.seedVersion || 1) < SEED_VERSION) {
+    const have = new Set((base.exercises || []).map((e) => e.name.trim().toLowerCase()));
+    const missing = SEED_EXERCISES
+      .filter((e) => !have.has(e.name.trim().toLowerCase()))
+      .map((e) => ({ id: uid(), ...e }));
+    base.exercises = [...(base.exercises || []), ...missing];
+    base.seedVersion = SEED_VERSION;
+  }
+  return base;
+};
+
+/* ------------------------------------------------------------------ */
+/* Date helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+function parseDate(s) { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); }
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  return Math.round((parseDate(dateStr) - now) / 86400000);
+}
+function weekStart(d) {
+  const x = new Date(d); x.setHours(0, 0, 0, 0);
+  const day = (x.getDay() + 6) % 7; // Monday = 0
+  x.setDate(x.getDate() - day); return x;
+}
+function fmtShort(d) { return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }); }
+function fmtDateStr(s) { return s ? parseDate(s).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }) : ""; }
+
+/* ------------------------------------------------------------------ */
+/* App                                                                 */
+/* ------------------------------------------------------------------ */
+
+export default function BadmintonTrainingHub() {
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("dashboard");
+  const [saveState, setSaveState] = useState("idle");
+  const [saveErrDetail, setSaveErrDetail] = useState("");
+  const [printing, setPrinting] = useState(null); // session being printed
+  const [slowLoad, setSlowLoad] = useState(false);
+  const [loadTick, setLoadTick] = useState(0);
+
+  // Load: shared storage first (family sync), personal storage as fallback/migration
+  useEffect(() => {
+    let cancelled = false;
+    setSlowLoad(false);
+    const timer = setTimeout(() => setSlowLoad(true), 6000);
+    (async () => {
+      let local = null;
+      try {
+        const res = await window.storage.get(STORE_KEY, true);
+        if (res && res.value) local = JSON.parse(res.value);
+      } catch (e) { /* no shared data yet */ }
+      if (!local) {
+        try {
+          const old = await window.storage.get(STORE_KEY); // pre-sync personal data
+          if (old && old.value) local = JSON.parse(old.value);
+        } catch (e) { /* fresh start */ }
+      }
+      local = normalize(local || DEFAULT_DATA);
+      if (!cancelled) setData(local);
+    })().finally(() => clearTimeout(timer));
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [loadTick]);
+
+  // Save on change: shared first (family sync), personal as fallback so data is never lost
+  useEffect(() => {
+    if (!data) return;
+    const t = setTimeout(async () => {
+      setSaveState("saving");
+      const payload = JSON.stringify(data);
+      if (!window.storage || typeof window.storage.set !== "function") {
+        setSaveState("nostorage");
+        return;
+      }
+      try {
+        await window.storage.set(STORE_KEY, payload, true);
+        setSaveState("saved");
+        setTimeout(() => setSaveState((s) => (s === "saved" ? "idle" : s)), 2000);
+      } catch (e) {
+        try {
+          await window.storage.set(STORE_KEY, payload); // personal fallback
+          setSaveState("local");
+        } catch (e2) {
+          setSaveErrDetail(String((e2 && e2.message) || e2));
+          setSaveState("error");
+        }
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [data]);
+
+  const update = (patch) => setData((d) => ({ ...d, ...patch, updatedAt: Date.now() }));
+
+  const [profile, setProfile] = useState(null); // "coach" or a player id
+
+  if (!data) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#F3F5F8", fontFamily: "Inter, system-ui, sans-serif", color: "#1E3A5F", textAlign: "center", padding: 20 }}>
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 10 }}>Loading your training hub…</div>
+          {slowLoad && (
+            <div style={{ fontSize: 14, color: "#5C6B7D", maxWidth: 320 }}>
+              This is taking longer than it should — storage may be slow.
+              <div style={{ marginTop: 10 }}>
+                <button onClick={() => setLoadTick((t) => t + 1)}
+                  style={{ font: "inherit", fontWeight: 600, background: "#1E3A5F", color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", cursor: "pointer" }}>
+                  Retry
+                </button>
+              </div>
+              <div style={{ marginTop: 10 }}>If it persists, fully close and reopen the Claude app.</div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (printing) {
+    return (
+      <div className="bth-root">
+        <StyleBlock />
+        <PrintSheet data={data} session={printing} onBack={() => setPrinting(null)} />
+      </div>
+    );
+  }
+
+  if (!profile) {
+    return (
+      <div className="bth-root">
+        <StyleBlock />
+        <ProfilePicker data={data} update={update} onPick={setProfile} />
+      </div>
+    );
+  }
+
+  const isCoach = profile === "coach";
+  const me = isCoach ? null : data.players.find((p) => p.id === profile);
+  const meId = isCoach ? null : profile;
+
+  const tabs = [
+    ["dashboard", "Court"],
+    ["sessions", "Sessions"],
+    ["exercises", "Exercise bank"],
+    ...(isCoach ? [["coach", "AI coach"]] : []),
+    ["progress", "Progress"],
+  ];
+
+  return (
+    <div className="bth-root">
+      <StyleBlock />
+      <CourtHeader data={data} update={update} saveState={saveState} saveErrDetail={saveErrDetail}
+        isCoach={isCoach} me={me} onSwitch={() => setProfile(null)} />
+
+      <nav className="bth-nav" aria-label="Sections">
+        {tabs.map(([id, label]) => (
+          <button key={id} className={"bth-tab" + (tab === id ? " active" : "")} onClick={() => setTab(id)}>
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      <main className="bth-main">
+        {tab === "dashboard" && <Dashboard data={data} update={update} goTo={setTab} onPrint={setPrinting} isCoach={isCoach} meId={meId} />}
+        {tab === "sessions" && <Sessions data={data} update={update} onPrint={setPrinting} isCoach={isCoach} meId={meId} />}
+        {tab === "exercises" && <ExerciseBank data={data} update={update} isCoach={isCoach} />}
+        {tab === "coach" && isCoach && <AICoach data={data} update={update} goTo={setTab} />}
+        {tab === "progress" && <Progress data={data} meId={meId} />}
+      </main>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Profile picker — who's on court                                     */
+/* ------------------------------------------------------------------ */
+
+function ProfilePicker({ data, update, onPick }) {
+  const [stage, setStage] = useState("pick"); // pick | coachpin | setpin
+  const [pin, setPin] = useState("");
+  const [newPin, setNewPin] = useState("");
+  const [err, setErr] = useState("");
+  const fileRef = React.useRef(null);
+  const hasPin = !!data.settings.coachPin;
+
+  const chooseCoach = () => { setErr(""); setPin(""); setStage(hasPin ? "coachpin" : "setpin"); };
+  const checkPin = () => {
+    if (pin === data.settings.coachPin) onPick("coach");
+    else setErr("That's not the coach PIN.");
+  };
+  const savePinAndEnter = () => {
+    if (newPin.trim()) update({ settings: { ...data.settings, coachPin: newPin.trim() } });
+    onPick("coach");
+  };
+  const restoreFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const restored = JSON.parse(reader.result);
+        update({ ...normalize(restored), updatedAt: Date.now() });
+        setErr("");
+      } catch (e) { setErr("That file doesn't look like a Shuttle Time backup."); }
+    };
+    reader.readAsText(file);
+  };
+
+  return (
+    <div className="bth-picker-screen">
+      <div className="bth-picker-card">
+        <div className="bth-eyebrow" style={{ color: "#fff" }}>Shuttle Time</div>
+        <h1>Who's on court?</h1>
+
+        {stage === "pick" && (
+          <div className="bth-picker-opts">
+            {data.players.map((p) => (
+              <button key={p.id} className="bth-picker-btn" onClick={() => onPick(p.id)}>
+                <span className="dot" style={{ background: p.color }} />{p.name}
+                <small>See my plan, log my sessions</small>
+              </button>
+            ))}
+            <button className="bth-picker-btn coach" onClick={chooseCoach}>
+              Coach
+              <small>Full access — plan, edit, AI coach</small>
+            </button>
+          </div>
+        )}
+
+        {stage === "coachpin" && (
+          <div className="bth-picker-opts">
+            <label>Coach PIN
+              <input type="password" inputMode="numeric" autoFocus value={pin}
+                onChange={(e) => setPin(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && checkPin()} />
+            </label>
+            {err && <p className="bth-error">{err}</p>}
+            <div className="bth-editactions">
+              <button className="bth-btn ghost light" onClick={() => setStage("pick")}>Back</button>
+              <button className="bth-btn smash" onClick={checkPin}>Enter as coach</button>
+            </div>
+          </div>
+        )}
+
+        {stage === "setpin" && (
+          <div className="bth-picker-opts">
+            <label>Set a coach PIN <small style={{ fontWeight: 400 }}>(optional — keeps the boys out of edit mode; this is a family lock, not real security)</small>
+              <input type="password" inputMode="numeric" autoFocus value={newPin}
+                placeholder="Leave blank for no PIN"
+                onChange={(e) => setNewPin(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && savePinAndEnter()} />
+            </label>
+            <div className="bth-editactions">
+              <button className="bth-btn ghost light" onClick={() => setStage("pick")}>Back</button>
+              <button className="bth-btn smash" onClick={savePinAndEnter}>Enter as coach</button>
+            </div>
+          </div>
+        )}
+
+        <p className="bth-restoreline">
+          <button className="bth-linkbtn light" onClick={() => fileRef.current?.click()}>Restore from a backup file</button>
+          <input ref={fileRef} type="file" accept="application/json" style={{ display: "none" }}
+            onChange={(e) => e.target.files[0] && restoreFile(e.target.files[0])} />
+        </p>
+        {err && stage === "pick" && <p className="bth-error">{err}</p>}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Header — top-down court with countdown                              */
+/* ------------------------------------------------------------------ */
+
+function CourtHeader({ data, update, saveState, saveErrDetail, isCoach, me, onSwitch }) {
+  const [editing, setEditing] = useState(false);
+  const d = daysUntil(data.tournament.date);
+
+  return (
+    <header className="bth-court">
+      <svg className="bth-courtlines" viewBox="0 0 800 190" preserveAspectRatio="none" aria-hidden="true">
+        <rect x="8" y="8" width="784" height="174" fill="none" stroke="#fff" strokeWidth="3" />
+        <line x1="8" y1="30" x2="792" y2="30" stroke="#fff" strokeWidth="2" />
+        <line x1="8" y1="160" x2="792" y2="160" stroke="#fff" strokeWidth="2" />
+        <line x1="400" y1="8" x2="400" y2="70" stroke="#fff" strokeWidth="2" />
+        <line x1="400" y1="120" x2="400" y2="182" stroke="#fff" strokeWidth="2" />
+        <line x1="8" y1="70" x2="792" y2="70" stroke="#fff" strokeWidth="2" />
+        <line x1="8" y1="120" x2="792" y2="120" stroke="#fff" strokeWidth="2" />
+        <line x1="300" y1="0" x2="300" y2="190" stroke="#fff" strokeWidth="1" strokeDasharray="6 6" opacity="0.5" />
+      </svg>
+
+      <div className="bth-court-inner">
+        <div>
+          <div className="bth-eyebrow">Family training hub</div>
+          <h1 className="bth-title">Shuttle&nbsp;Time</h1>
+          <div className="bth-players">
+            {data.players.map((p) => (
+              <PlayerChip key={p.id} player={p} canEdit={isCoach}
+                onRename={(name) =>
+                  update({ players: data.players.map((x) => x.id === p.id ? { ...x, name } : x) })}
+                onRecolor={(color) =>
+                  update({ players: data.players.map((x) => x.id === p.id ? { ...x, color } : x) })} />
+            ))}
+          </div>
+          <div className="bth-whoami">
+            On court as <strong>{isCoach ? "Coach" : me?.name}</strong>
+            <button onClick={onSwitch}>switch</button>
+          </div>
+        </div>
+
+        <div className={"bth-countdown" + (isCoach ? "" : " readonly")}
+          onClick={() => isCoach && setEditing(true)} role={isCoach ? "button" : undefined}
+          tabIndex={isCoach ? 0 : undefined}
+          onKeyDown={(e) => isCoach && e.key === "Enter" && setEditing(true)}>
+          {editing && isCoach ? (
+            <div className="bth-tourney-edit" onClick={(e) => e.stopPropagation()}>
+              <input value={data.tournament.name} placeholder="Tournament name"
+                onChange={(e) => update({ tournament: { ...data.tournament, name: e.target.value } })} />
+              <input type="date" value={data.tournament.date}
+                onChange={(e) => update({ tournament: { ...data.tournament, date: e.target.value } })} />
+              <button className="bth-btn small" onClick={() => setEditing(false)}>Done</button>
+            </div>
+          ) : d === null ? (
+            <div className="bth-count-empty">{isCoach ? "＋ Set next tournament date" : "No tournament set yet"}</div>
+          ) : (
+            <>
+              <div className="bth-count-num">{d >= 0 ? d : "–"}</div>
+              <div className="bth-count-label">
+                {d >= 0 ? "days to" : "days since"}<br />
+                <strong>{data.tournament.name || "tournament"}</strong>
+                <span className="bth-count-date">{fmtDateStr(data.tournament.date)}</span>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+      <div className={"bth-save " + saveState}>
+        {saveState === "saving" ? "Saving…"
+          : saveState === "saved" ? "Saved ✓"
+          : saveState === "local" ? "Saved to your account — family sync unavailable"
+          : saveState === "nostorage" ? "Storage isn't available in this view — see fix below"
+          : saveState === "error" ? `Couldn't save: ${saveErrDetail || "unknown error"}` : ""}
+      </div>
+      {(saveState === "error" || saveState === "nostorage") && (
+        <div className="bth-savehelp">
+          Your changes aren't being stored right now, so don't rely on this session.
+          <button onClick={() => {
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url; a.download = "shuttle-time-backup.json"; a.click();
+            URL.revokeObjectURL(url);
+          }}>Download a backup now</button>
+          — try fully closing and reopening the app, or open this artifact at claude.ai in a browser instead.
+        </div>
+      )}
+    </header>
+  );
+}
+
+function PlayerChip({ player, canEdit, onRename, onRecolor }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(player.name);
+  if (editing && canEdit) {
+    return (
+      <span className="bth-chip editing">
+        <input autoFocus value={val} onChange={(e) => setVal(e.target.value)}
+          onBlur={() => { onRename(val.trim() || player.name); setEditing(false); }}
+          onKeyDown={(e) => { if (e.key === "Enter") { onRename(val.trim() || player.name); setEditing(false); } }} />
+        <span className="bth-swatches">
+          {PLAYER_COLORS.map((c) => (
+            <button key={c} className="bth-swatch"
+              style={{ background: c, outline: player.color === c ? "2px solid #fff" : "none" }}
+              aria-label={"Set color " + c}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onRecolor(c)} />
+          ))}
+        </span>
+      </span>
+    );
+  }
+  return (
+    <button className="bth-chip" style={{ borderColor: player.color, cursor: canEdit ? "pointer" : "default" }}
+      onClick={() => canEdit && setEditing(true)} title={canEdit ? "Tap to rename or recolor" : undefined}>
+      <span className="dot" style={{ background: player.color }} />{player.name}
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Dashboard                                                           */
+/* ------------------------------------------------------------------ */
+
+function Dashboard({ data, update, goTo, onPrint, isCoach, meId }) {
+  const [completing, setCompleting] = useState(null);
+  const now = new Date();
+  const ws = weekStart(now);
+  const mine = (s) => isCoach || s.playerIds.includes(meId);
+  const thisWeek = data.sessions.filter(mine).filter((s) => { const dt = parseDate(s.date); return dt >= ws && dt < new Date(ws.getTime() + 7 * 86400000); });
+  const done = thisWeek.filter((s) => s.status === "done");
+  const minutes = done.reduce((a, s) => a + s.duration, 0);
+  const upcoming = data.sessions.filter(mine)
+    .filter((s) => s.status === "planned" && parseDate(s.date) >= new Date(now.getFullYear(), now.getMonth(), now.getDate()))
+    .sort((a, b) => a.date.localeCompare(b.date)).slice(0, 4);
+
+  const finish = (id, feedback) => {
+    update({ sessions: data.sessions.map((s) => s.id === id ? { ...s, status: "done", feedback: { ...(s.feedback || {}), ...feedback } } : s) });
+    setCompleting(null);
+  };
+  const needsMyRating = (s) => !isCoach && s.status === "done" && s.playerIds.includes(meId) && !(s.feedback && s.feedback[meId]);
+
+  return (
+    <div>
+      <div className="bth-statrow">
+        <StatCard label="Sessions this week" value={done.length} sub={`${thisWeek.length - done.length} planned`} />
+        <StatCard label="Court + gym time" value={minutes >= 60 ? (minutes / 60).toFixed(1) + "h" : minutes + "m"} sub="this week" />
+        <StatCard label="Exercise bank" value={data.exercises.length} sub="drills & workouts" />
+      </div>
+
+      <section className="bth-panel">
+        <div className="bth-panel-head">
+          <h2>Coming up</h2>
+          {isCoach && (
+            <div>
+              <button className="bth-btn ghost" onClick={() => goTo("coach")}>Ask the AI coach</button>
+              <button className="bth-btn" onClick={() => goTo("sessions")}>Plan a session</button>
+            </div>
+          )}
+        </div>
+        {upcoming.length === 0 ? (
+          <p className="bth-empty">{isCoach
+            ? "Nothing planned yet. Plan a session yourself, or let the AI coach build one around your next tournament."
+            : "Nothing planned for you yet — ask Coach to schedule the next session."}</p>
+        ) : (
+          upcoming.map((s) => <SessionRow key={s.id} s={s} data={data} onDone={() => setCompleting(s)} onPrint={() => onPrint(s)} />)
+        )}
+      </section>
+
+      <section className="bth-panel">
+        <div className="bth-panel-head"><h2>Recently completed</h2></div>
+        {done.length === 0 ? (
+          <p className="bth-empty">Completed sessions will show up here — first one of the week is the hardest.</p>
+        ) : (
+          [...done].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 3)
+            .map((s) => <SessionRow key={s.id} s={s} data={data} onPrint={() => onPrint(s)}
+              onRate={needsMyRating(s) ? () => setCompleting(s) : undefined} />)
+        )}
+      </section>
+
+      {completing && (
+        <CompleteSession session={completing} data={data}
+          ratePlayerIds={isCoach ? completing.playerIds : [meId]}
+          onSave={(fb) => finish(completing.id, fb)} onCancel={() => setCompleting(null)} />
+      )}
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub }) {
+  return (
+    <div className="bth-stat">
+      <div className="bth-stat-value">{value}</div>
+      <div className="bth-stat-label">{label}</div>
+      <div className="bth-stat-sub">{sub}</div>
+    </div>
+  );
+}
+
+function SessionRow({ s, data, onDone, onEdit, onDelete, onPrint, onRate }) {
+  const names = s.playerIds.map((id) => data.players.find((p) => p.id === id)?.name).filter(Boolean).join(" + ");
+  const feedback = s.feedback && Object.entries(s.feedback)
+    .map(([pid, f]) => ({ p: data.players.find((x) => x.id === pid), f }))
+    .filter((x) => x.p);
+  return (
+    <div className={"bth-sessionrow " + s.status}>
+      <div className="bth-sr-date">
+        <span>{fmtDateStr(s.date)}</span>
+        <span className="bth-sr-type">{TYPE_SHORT[s.type] || s.type}</span>
+      </div>
+      <div className="bth-sr-main">
+        <div className="bth-sr-title">{s.title}</div>
+        <div className="bth-sr-meta">{names} · {s.duration} min · {s.blocks.length} block{s.blocks.length !== 1 ? "s" : ""}</div>
+        {s.blocks.length > 0 && (
+          <div className="bth-sr-blocks">
+            {s.blocks.map((b, i) => <span key={i} className="bth-block-pill">{b.name} <em>{b.minutes}m</em></span>)}
+          </div>
+        )}
+        {s.notes && <div className="bth-sr-notes">{s.notes}</div>}
+        {feedback && feedback.length > 0 && (
+          <div className="bth-sr-feedback">
+            {feedback.map(({ p, f }) => (
+              <span key={p.id}><strong>{p.name}</strong> {"🏸".repeat(f.effort || 0)}{f.note ? ` — ${f.note}` : ""}</span>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="bth-sr-actions">
+        {s.status === "planned" && onDone && <button className="bth-btn small" onClick={onDone}>Mark done</button>}
+        {s.status === "done" && <span className="bth-donebadge">Done ✓</span>}
+        {onRate && <button className="bth-btn small" onClick={onRate}>Add my rating</button>}
+        {onPrint && <button className="bth-btn small ghost" onClick={onPrint}>Print</button>}
+        {onEdit && <button className="bth-btn small ghost" onClick={onEdit}>Edit</button>}
+        {onDelete && <button className="bth-btn small danger" onClick={onDelete}>Delete</button>}
+      </div>
+    </div>
+  );
+}
+
+function CompleteSession({ session, data, onSave, onCancel, ratePlayerIds }) {
+  const ids = (ratePlayerIds && ratePlayerIds.length ? ratePlayerIds : session.playerIds).filter(Boolean);
+  const [fb, setFb] = useState(() => {
+    const o = {};
+    ids.forEach((id) => { o[id] = { effort: 3, note: "" }; });
+    return o;
+  });
+  const labels = ["", "Easy", "Steady", "Good work", "Tough", "Max effort"];
+  return (
+    <div className="bth-overlay" role="dialog" aria-label="Complete session">
+      <div className="bth-modal">
+        <h3>How did it go?</h3>
+        <p className="bth-modal-sub">{session.title} · {fmtDateStr(session.date)}</p>
+        {ids.map((pid) => {
+          const p = data.players.find((x) => x.id === pid);
+          if (!p) return null;
+          return (
+            <div key={pid} className="bth-fbrow">
+              <div className="bth-fbname"><span className="dot" style={{ background: p.color }} />{p.name}</div>
+              <div className="bth-effort">
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <button key={n} className={"bth-effbtn" + (fb[pid].effort >= n ? " on" : "")}
+                    aria-label={`Effort ${n} of 5`}
+                    onClick={() => setFb({ ...fb, [pid]: { ...fb[pid], effort: n } })}>🏸</button>
+                ))}
+                <span className="bth-efflabel">{labels[fb[pid].effort]}</span>
+              </div>
+              <input placeholder="Optional note — what clicked, what to fix" value={fb[pid].note}
+                onChange={(e) => setFb({ ...fb, [pid]: { ...fb[pid], note: e.target.value } })} />
+            </div>
+          );
+        })}
+        <div className="bth-editactions">
+          <button className="bth-btn ghost" onClick={onCancel}>Cancel</button>
+          <button className="bth-btn" onClick={() => onSave(fb)}>Save & mark done</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PrintSheet({ data, session, onBack }) {
+  const names = session.playerIds.map((id) => data.players.find((p) => p.id === id)).filter(Boolean);
+  const d = daysUntil(data.tournament.date);
+  const blocks = session.blocks.length ? session.blocks : [
+    { name: "Warm-up", minutes: 10 },
+    { name: "Main work", minutes: Math.max(10, session.duration - 20) },
+    { name: "Cool-down & stretch", minutes: 10 },
+  ];
+  return (
+    <div className="bth-sheetwrap">
+      <div className="bth-noprint bth-sheetbar">
+        <button className="bth-btn ghost" onClick={onBack}>← Back to app</button>
+        <button className="bth-btn" onClick={() => window.print()}>Print</button>
+      </div>
+      <div className="bth-sheet">
+        <div className="bth-sheet-head">
+          <div>
+            <div className="bth-sheet-eyebrow">Shuttle Time — courtside session sheet</div>
+            <h1>{session.title}</h1>
+            <div className="bth-sheet-meta">
+              {fmtDateStr(session.date)} · {session.type} · {session.duration} min · {names.map((p) => p.name).join(" + ")}
+            </div>
+          </div>
+          {d !== null && d >= 0 && (
+            <div className="bth-sheet-count">{d}<span>days to<br />{data.tournament.name}</span></div>
+          )}
+        </div>
+        <table className="bth-sheet-table">
+          <thead>
+            <tr>
+              <th style={{ width: "48%" }}>Block</th>
+              <th>Min</th>
+              {names.map((p) => <th key={p.id}>{p.name}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {blocks.map((b, i) => {
+              const ex = data.exercises.find((e) => e.id === b.exerciseId);
+              return (
+                <tr key={i}>
+                  <td><strong>{b.name}</strong>{ex?.desc && <div className="bth-sheet-desc">{ex.desc}</div>}</td>
+                  <td>{b.minutes}</td>
+                  {names.map((p) => <td key={p.id} className="bth-sheet-check">☐</td>)}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {session.notes && <div className="bth-sheet-notes"><strong>Coach notes:</strong> {session.notes}</div>}
+        <div className="bth-sheet-effort">
+          {names.map((p) => (
+            <div key={p.id}><strong>{p.name}</strong> — effort today: 1 ☐&nbsp;&nbsp;2 ☐&nbsp;&nbsp;3 ☐&nbsp;&nbsp;4 ☐&nbsp;&nbsp;5 ☐</div>
+          ))}
+        </div>
+        <div className="bth-sheet-lines">
+          <strong>Notes from today</strong>
+          <div /><div /><div />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Sessions                                                            */
+/* ------------------------------------------------------------------ */
+
+function emptySession(data) {
+  return {
+    id: uid(), date: todayStr(), title: "", type: "Mixed",
+    playerIds: data.players.map((p) => p.id), duration: 90,
+    blocks: [], notes: "", status: "planned",
+  };
+}
+
+function Sessions({ data, update, onPrint, isCoach, meId }) {
+  const [editing, setEditing] = useState(null); // session object being edited
+  const [completing, setCompleting] = useState(null);
+  const [filter, setFilter] = useState("all");
+
+  const save = (s) => {
+    const exists = data.sessions.some((x) => x.id === s.id);
+    update({ sessions: exists ? data.sessions.map((x) => (x.id === s.id ? s : x)) : [...data.sessions, s] });
+    setEditing(null);
+  };
+  const remove = (id) => update({ sessions: data.sessions.filter((s) => s.id !== id) });
+  const finish = (id, feedback) => {
+    update({ sessions: data.sessions.map((s) => (s.id === id ? { ...s, status: "done", feedback: { ...(s.feedback || {}), ...feedback } } : s)) });
+    setCompleting(null);
+  };
+  const needsMyRating = (s) => !isCoach && s.status === "done" && s.playerIds.includes(meId) && !(s.feedback && s.feedback[meId]);
+
+  const shown = data.sessions
+    .filter((s) => isCoach || s.playerIds.includes(meId))
+    .filter((s) => filter === "all" || s.status === filter)
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  if (editing) return <SessionEditor data={data} session={editing} onSave={save} onCancel={() => setEditing(null)} />;
+
+  return (
+    <div>
+      <div className="bth-panel-head standalone">
+        <h2>Training sessions</h2>
+        <div>
+          {["all", "planned", "done"].map((f) => (
+            <button key={f} className={"bth-tab mini" + (filter === f ? " active" : "")} onClick={() => setFilter(f)}>{f}</button>
+          ))}
+          {isCoach && <button className="bth-btn" onClick={() => setEditing(emptySession(data))}>＋ New session</button>}
+        </div>
+      </div>
+      {shown.length === 0
+        ? <p className="bth-empty">No sessions here yet. Create one, or ask the AI coach to draft a plan.</p>
+        : shown.map((s) => (
+          <SessionRow key={s.id} s={s} data={data}
+            onDone={s.status === "planned" ? () => setCompleting(s) : undefined}
+            onRate={needsMyRating(s) ? () => setCompleting(s) : undefined}
+            onPrint={() => onPrint(s)}
+            onEdit={isCoach ? () => setEditing({ ...s }) : undefined}
+            onDelete={isCoach ? () => remove(s.id) : undefined} />
+        ))}
+      {completing && (
+        <CompleteSession session={completing} data={data}
+          ratePlayerIds={isCoach ? completing.playerIds : [meId]}
+          onSave={(fb) => finish(completing.id, fb)} onCancel={() => setCompleting(null)} />
+      )}
+    </div>
+  );
+}
+
+function SessionEditor({ data, session, onSave, onCancel }) {
+  const [s, setS] = useState(session);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const set = (patch) => setS((x) => ({ ...x, ...patch }));
+  const blockMinutes = s.blocks.reduce((a, b) => a + (Number(b.minutes) || 0), 0);
+
+  const togglePlayer = (id) =>
+    set({ playerIds: s.playerIds.includes(id) ? s.playerIds.filter((x) => x !== id) : [...s.playerIds, id] });
+
+  const addBlock = (ex) => {
+    set({ blocks: [...s.blocks, { exerciseId: ex.id, name: ex.name, minutes: 15 }] });
+    setPickerOpen(false);
+  };
+
+  return (
+    <div className="bth-panel">
+      <div className="bth-panel-head"><h2>{data.sessions.some((x) => x.id === s.id) ? "Edit session" : "New session"}</h2></div>
+
+      <div className="bth-formgrid">
+        <label>Title
+          <input value={s.title} placeholder="e.g. Tuesday footwork + net play" onChange={(e) => set({ title: e.target.value })} />
+        </label>
+        <label>Date
+          <input type="date" value={s.date} onChange={(e) => set({ date: e.target.value })} />
+        </label>
+        <label>Session type
+          <select value={s.type} onChange={(e) => set({ type: e.target.value })}>
+            {SESSION_TYPES.map((t) => <option key={t}>{t}</option>)}
+          </select>
+        </label>
+        <label>Duration: <strong>{s.duration} min</strong>
+          <input type="range" min="30" max="180" step="15" value={s.duration}
+            onChange={(e) => set({ duration: Number(e.target.value) })} />
+        </label>
+      </div>
+
+      <div className="bth-field">
+        <span className="bth-fieldlabel">Who's training</span>
+        {data.players.map((p) => (
+          <button key={p.id} className={"bth-chip select" + (s.playerIds.includes(p.id) ? " on" : "")}
+            style={s.playerIds.includes(p.id) ? { borderColor: p.color } : {}}
+            onClick={() => togglePlayer(p.id)}>
+            <span className="dot" style={{ background: p.color }} />{p.name}
+          </button>
+        ))}
+      </div>
+
+      <div className="bth-field">
+        <span className="bth-fieldlabel">
+          Blocks — {blockMinutes} of {s.duration} min planned
+          {blockMinutes > s.duration && <em className="bth-warn"> (over time)</em>}
+        </span>
+        {s.blocks.map((b, i) => (
+          <div key={i} className="bth-blockrow">
+            <span className="bth-blockname">{b.name}</span>
+            <input type="number" min="5" max="60" value={b.minutes}
+              onChange={(e) => set({ blocks: s.blocks.map((x, j) => j === i ? { ...x, minutes: Number(e.target.value) } : x) })} /> min
+            <button className="bth-btn small danger" onClick={() => set({ blocks: s.blocks.filter((_, j) => j !== i) })}>✕</button>
+          </div>
+        ))}
+        <button className="bth-btn ghost" onClick={() => setPickerOpen((o) => !o)}>＋ Add exercise block</button>
+        {pickerOpen && (
+          <div className="bth-picker">
+            {data.exercises.map((ex) => (
+              <button key={ex.id} className="bth-pickitem" onClick={() => addBlock(ex)}>
+                <strong>{ex.name}</strong> <span>{TYPE_SHORT[ex.type]}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <label className="bth-field">Notes
+        <textarea rows={2} value={s.notes} placeholder="Coaching points, how it went, what to repeat…"
+          onChange={(e) => set({ notes: e.target.value })} />
+      </label>
+
+      <div className="bth-editactions">
+        <button className="bth-btn ghost" onClick={onCancel}>Cancel</button>
+        <button className="bth-btn" disabled={s.playerIds.length === 0}
+          onClick={() => onSave({ ...s, title: s.title.trim() || `${TYPE_SHORT[s.type]} session` })}>
+          Save session
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Exercise bank                                                       */
+/* ------------------------------------------------------------------ */
+
+function ExerciseBank({ data, update, isCoach }) {
+  const [q, setQ] = useState("");
+  const [cat, setCat] = useState("");
+  const [editing, setEditing] = useState(null);
+
+  const shown = data.exercises.filter((e) =>
+    (!cat || e.categories.includes(cat)) &&
+    (!q || (e.name + " " + e.desc + " " + e.categories.join(" ")).toLowerCase().includes(q.toLowerCase()))
+  );
+
+  const save = (ex) => {
+    const exists = data.exercises.some((x) => x.id === ex.id);
+    update({ exercises: exists ? data.exercises.map((x) => (x.id === ex.id ? ex : x)) : [...data.exercises, ex] });
+    setEditing(null);
+  };
+  const remove = (id) => update({ exercises: data.exercises.filter((e) => e.id !== id) });
+
+  if (editing) return <ExerciseEditor exercise={editing} onSave={save} onCancel={() => setEditing(null)} />;
+
+  return (
+    <div>
+      <div className="bth-panel-head standalone">
+        <h2>Exercise bank</h2>
+        {isCoach && <button className="bth-btn" onClick={() => setEditing({ id: uid(), name: "", type: SESSION_TYPES[0], categories: [], desc: "" })}>＋ Add exercise</button>}
+      </div>
+      <input className="bth-search" placeholder="Search exercises…" value={q} onChange={(e) => setQ(e.target.value)} />
+      <div className="bth-catrow">
+        <button className={"bth-cat" + (!cat ? " on" : "")} onClick={() => setCat("")}>All</button>
+        {CATEGORIES.map((c) => (
+          <button key={c} className={"bth-cat" + (cat === c ? " on" : "")} onClick={() => setCat(cat === c ? "" : c)}>{c}</button>
+        ))}
+      </div>
+      <div className="bth-exgrid">
+        {shown.map((ex) => (
+          <div key={ex.id} className="bth-excard">
+            <div className="bth-ex-type">{TYPE_SHORT[ex.type]}</div>
+            <h3>{ex.name}</h3>
+            <p>{ex.desc}</p>
+            <div className="bth-ex-tags">{ex.categories.map((c) => <span key={c}>{c}</span>)}</div>
+            {isCoach && (
+              <div className="bth-ex-actions">
+                <button className="bth-btn small ghost" onClick={() => setEditing({ ...ex })}>Edit</button>
+                <button className="bth-btn small danger" onClick={() => remove(ex.id)}>Delete</button>
+              </div>
+            )}
+          </div>
+        ))}
+        {shown.length === 0 && <p className="bth-empty">No exercises match. Add one — the bank grows as you go.</p>}
+      </div>
+    </div>
+  );
+}
+
+function ExerciseEditor({ exercise, onSave, onCancel }) {
+  const [ex, setEx] = useState(exercise);
+  const toggleCat = (c) =>
+    setEx((x) => ({ ...x, categories: x.categories.includes(c) ? x.categories.filter((y) => y !== c) : [...x.categories, c] }));
+  return (
+    <div className="bth-panel">
+      <div className="bth-panel-head"><h2>{exercise.name ? "Edit exercise" : "New exercise"}</h2></div>
+      <div className="bth-formgrid">
+        <label>Name<input value={ex.name} placeholder="e.g. Multi-shuttle smash defense" onChange={(e) => setEx({ ...ex, name: e.target.value })} /></label>
+        <label>Type
+          <select value={ex.type} onChange={(e) => setEx({ ...ex, type: e.target.value })}>
+            {SESSION_TYPES.filter((t) => t !== "Mixed").map((t) => <option key={t}>{t}</option>)}
+          </select>
+        </label>
+      </div>
+      <div className="bth-field">
+        <span className="bth-fieldlabel">Keywords</span>
+        <div className="bth-catrow wrap">
+          {CATEGORIES.map((c) => (
+            <button key={c} className={"bth-cat" + (ex.categories.includes(c) ? " on" : "")} onClick={() => toggleCat(c)}>{c}</button>
+          ))}
+        </div>
+      </div>
+      <label className="bth-field">How it works
+        <textarea rows={3} value={ex.desc} placeholder="Sets, reps, feeds, coaching points…" onChange={(e) => setEx({ ...ex, desc: e.target.value })} />
+      </label>
+      <div className="bth-editactions">
+        <button className="bth-btn ghost" onClick={onCancel}>Cancel</button>
+        <button className="bth-btn" disabled={!ex.name.trim()} onClick={() => onSave(ex)}>Save exercise</button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* AI Coach                                                            */
+/* ------------------------------------------------------------------ */
+
+function AICoach({ data, update, goTo }) {
+  const [focus, setFocus] = useState("");
+  const [duration, setDuration] = useState(90);
+  const [playerIds, setPlayerIds] = useState(data.players.map((p) => p.id));
+  const [loading, setLoading] = useState(false);
+  const [plan, setPlan] = useState(null);
+  const [error, setError] = useState("");
+  const [mode, setMode] = useState("single");
+  const [testMsg, setTestMsg] = useState("");
+
+  const testAI = async () => {
+    setTestMsg("Testing…");
+    const t0 = Date.now();
+    try {
+      await callClaude("Reply with the single word OK.");
+      setTestMsg(`✓ AI reachable (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+    } catch (e) {
+      setTestMsg("✗ " + e.message);
+    }
+  };
+
+  const togglePlayer = (id) =>
+    setPlayerIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]);
+
+  const generate = async () => {
+    setLoading(true); setError(""); setPlan(null);
+    const d = daysUntil(data.tournament.date);
+    const recent = [...data.sessions].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6)
+      .map((s) => `${s.date} ${s.status} ${TYPE_SHORT[s.type] || s.type} ${s.duration}m: ${s.blocks.map((b) => b.name).join(", ") || "-"}`);
+    const bank = data.exercises.map((e) => `${e.id}|${e.name}|${TYPE_SHORT[e.type] || e.type}|${(e.categories || []).join(",")}`).join("\n");
+    const names = playerIds.map((id) => data.players.find((p) => p.id === id)?.name).join(" and ");
+
+    const prompt = `You are a youth badminton coach planning ONE training session for ${names || "two junior players"}.
+
+Context:
+- ${d === null ? "No tournament date set." : d >= 0 ? `Next tournament ("${data.tournament.name}") is in ${d} days.` : "Last tournament has passed; this is a rebuilding phase."}
+- Periodize sensibly: far from tournament = strength/cardio base; 2-4 weeks out = power, speed, intense multi-shuttle; final week = sharpness, footwork quality, tactics, lower volume.
+- Session duration: ${duration} minutes total (include warm-up and cool-down inside this time).
+- Requested focus: ${focus || "coach's choice, add variety versus recent sessions"}.
+- Recent sessions (newest first): ${recent.length ? recent.join(" | ") : "none logged yet"}.
+- Exercise bank, one per line as id|name|type|keywords (prefer these, reference by id):
+${bank}
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{"title": string, "type": one of ${JSON.stringify(SESSION_TYPES)}, "rationale": string (max 35 words, aimed at the parent-coach, mention tournament timing), "blocks": [{"exerciseId": string or null, "name": string, "minutes": number, "coachNotes": string (max 12 words)}]}
+Blocks must sum to ${duration} minutes. Use 4-6 blocks. Keep every string short. If a needed exercise isn't in the bank, set exerciseId to null and invent it with a clear name.`;
+
+    try {
+      const { text, truncated } = await callClaude(prompt);
+      const parsed = parseJsonLoose(text);
+      if (!parsed.blocks || !Array.isArray(parsed.blocks) || !parsed.blocks.length) throw new Error("The AI's plan had no blocks");
+      setPlan(parsed);
+      if (truncated) setError("Note: the reply was trimmed to fit — the plan below may be missing a block. Redraft if it looks short.");
+    } catch (e) {
+      setError("The coach hit a problem: " + e.message + " — tap Draft again to retry.");
+    } finally { setLoading(false); }
+  };
+
+  const saveAsSession = () => {
+    const newExercises = [];
+    const blocks = plan.blocks.map((b) => {
+      let exId = b.exerciseId && data.exercises.some((e) => e.id === b.exerciseId) ? b.exerciseId : null;
+      if (!exId) {
+        const ex = { id: uid(), name: b.name, type: plan.type === "Mixed" ? "Footwork drills" : plan.type, categories: [], desc: b.coachNotes || "" };
+        newExercises.push(ex); exId = ex.id;
+      }
+      return { exerciseId: exId, name: b.name, minutes: Math.max(5, Math.round(b.minutes)) };
+    });
+    const session = {
+      id: uid(), date: todayStr(), title: plan.title, type: SESSION_TYPES.includes(plan.type) ? plan.type : "Mixed",
+      playerIds, duration, blocks, notes: plan.rationale || "", status: "planned",
+    };
+    update({ sessions: [...data.sessions, session], exercises: [...data.exercises, ...newExercises] });
+    goTo("sessions");
+  };
+
+  const d = daysUntil(data.tournament.date);
+
+  return (
+    <div className="bth-panel">
+      <div className="bth-panel-head">
+        <h2>AI coach</h2>
+        <div>
+          <button className={"bth-tab mini" + (mode === "single" ? " active" : "")} onClick={() => setMode("single")}>Single session</button>
+          <button className={"bth-tab mini" + (mode === "program" ? " active" : "")} onClick={() => setMode("program")}>Tournament build-up</button>
+        </div>
+      </div>
+
+      <p className="bth-testline">
+        <button className="bth-linkbtn" onClick={testAI}>Test AI connection</button>
+        {testMsg && <span> {testMsg}</span>}
+      </p>
+
+      {mode === "program" && (
+        <ProgramBuilder data={data} update={update} goTo={goTo}
+          playerIds={playerIds} togglePlayer={togglePlayer} />
+      )}
+
+      {mode === "single" && (<>
+      <p className="bth-coachintro">
+        The coach reads your exercise bank, the last few sessions, and the tournament countdown
+        {d !== null && d >= 0 && <> (<strong>{d} days</strong> out — it will periodize accordingly)</>}, then drafts a session you can save and edit.
+      </p>
+
+      <label className="bth-field">What should this session focus on?
+        <textarea rows={2} value={focus} placeholder="e.g. explosive power and back-court smashes / recovery after tournament / net play under pressure"
+          onChange={(e) => setFocus(e.target.value)} />
+      </label>
+
+      <div className="bth-formgrid">
+        <label>Duration: <strong>{duration} min</strong>
+          <input type="range" min="30" max="180" step="15" value={duration} onChange={(e) => setDuration(Number(e.target.value))} />
+        </label>
+        <div className="bth-field">
+          <span className="bth-fieldlabel">Training</span>
+          {data.players.map((p) => (
+            <button key={p.id} className={"bth-chip select" + (playerIds.includes(p.id) ? " on" : "")}
+              style={playerIds.includes(p.id) ? { borderColor: p.color } : {}} onClick={() => togglePlayer(p.id)}>
+              <span className="dot" style={{ background: p.color }} />{p.name}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <button className="bth-btn big" disabled={loading || playerIds.length === 0} onClick={generate}>
+        {loading ? "Drafting the session…" : "Draft a session"}
+      </button>
+      {error && <p className="bth-error">{error}</p>}
+
+      {plan && (
+        <div className="bth-plan">
+          <h3>{plan.title}</h3>
+          <p className="bth-plan-rationale">{plan.rationale}</p>
+          {plan.blocks.map((b, i) => (
+            <div key={i} className="bth-planblock">
+              <div className="bth-planblock-head"><strong>{b.name}</strong><span>{b.minutes} min</span></div>
+              {b.coachNotes && <p>{b.coachNotes}</p>}
+            </div>
+          ))}
+          <div className="bth-editactions">
+            <button className="bth-btn ghost" onClick={generate}>Redraft</button>
+            <button className="bth-btn" onClick={saveAsSession}>Save as planned session</button>
+          </div>
+        </div>
+      )}
+      </>)}
+    </div>
+  );
+}
+
+/* Multi-week tournament build-up */
+
+const DAY_IDX = { MO: 0, TU: 1, WE: 2, TH: 3, FR: 4, SA: 5, SU: 6 };
+const DAY_NAME = { MO: "Mon", TU: "Tue", WE: "Wed", TH: "Thu", FR: "Fri", SA: "Sat", SU: "Sun" };
+const localISO = (dt) =>
+  `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+
+function ProgramBuilder({ data, update, goTo, playerIds, togglePlayer }) {
+  const [focus, setFocus] = useState("");
+  const [onCourt, setOnCourt] = useState(4);
+  const [offCourt, setOffCourt] = useState(2);
+  const [loading, setLoading] = useState(false);
+  const [progressMsg, setProgressMsg] = useState("");
+  const [program, setProgram] = useState(null);
+  const [error, setError] = useState("");
+
+  const d = daysUntil(data.tournament.date);
+  if (d === null || d <= 0) {
+    return (
+      <p className="bth-empty">
+        Set a future tournament date on the Court tab first — the build-up plan is periodized backwards from that date.
+      </p>
+    );
+  }
+  const weeks = Math.min(Math.max(Math.ceil(d / 7), 1), 6);
+
+  const generate = async () => {
+    setLoading(true); setError(""); setProgram(null); setProgressMsg("");
+    const total = onCourt + offCourt;
+    const names = playerIds.map((id) => data.players.find((p) => p.id === id)?.name).join(" and ");
+    const bank = data.exercises.map((e) => `${e.id}|${e.name}|${TYPE_SHORT[e.type] || e.type}|${(e.categories || []).join(",")}`).join("\n");
+    const chunk = Math.max(1, Math.min(3, Math.floor(12 / Math.max(1, total)))); // ≤ ~12 sessions per AI call so replies fit
+
+    const buildPrompt = (start, end, existing) => {
+      const prior = existing && existing.weeks.length
+        ? `Program title: "${existing.title}". Weeks already planned (week:theme): ${existing.weeks.map((w) => `${w.n}:${w.theme}`).join("; ")}. Continue the same program consistently without repeating identical sessions.`
+        : "";
+      const shape = start === 1
+        ? `{"title":str,"overview":str (max 25 words),"weeks":[...]}`
+        : `{"weeks":[...]}`;
+      return `You are a youth badminton coach building a ${weeks}-week tournament build-up program for ${names || "two junior players"}. Each week has exactly ${onCourt} on-court session(s) (footwork drills, multi-shuttle, or single shuttle rally) and ${offCourt} off-court session(s) (strength & conditioning or running). The tournament ("${data.tournament.name}") is in ${d} days.
+With ${total} sessions across 7 days, some days are doubles: put an off-court session on the same day as an on-court session (repeat the same "day" code), keeping runs easy the day before hard court work.
+Periodize across ALL ${weeks} weeks: early = strength, cardio and movement base; middle = power, speed, agility, intense multi-shuttle; final week = sharpness, quality footwork, lower volume taper.${total >= 6 ? " Include at least one lighter recovery-style session (easy run or mobility) per week and one full rest day." : ""}
+Focus request from the parent: ${focus || "balanced all-round development"}. ${prior}
+Now produce ONLY weeks ${start} to ${end}.
+Sessions are 30-180 minutes (multiples of 15; runs may be short, court sessions 60+).
+Exercise bank, one per line as id|name|type|keywords — strongly prefer these, reference by id:
+${bank}
+Respond with ONLY compact JSON, no markdown fences, no commentary, minimal whitespace:
+${shape} where weeks = [{"n":${start},"theme":str (3-4 words),"sessions":[{"day":"MO"|"TU"|"WE"|"TH"|"FR"|"SA"|"SU","title":str,"type":one of ${JSON.stringify(SESSION_TYPES)},"minutes":num,"blocks":[["<exerciseId from bank, or a new drill name>",minutes],...]}]}]
+Exactly ${onCourt} on-court and ${offCourt} off-court sessions per week, ${total >= 5 ? "exactly 2" : "2-3"} blocks per session (a single run may be 1 block), block minutes sum to session minutes. Keep every string short.`;
+    };
+
+    let all = null;
+    try {
+      for (let start = 1; start <= weeks; start += chunk) {
+        const end = Math.min(weeks, start + chunk - 1);
+        setProgressMsg(weeks > chunk ? `Building weeks ${start}–${end} of ${weeks}…` : "Building the program…");
+        const { text, truncated } = await callClaude(buildPrompt(start, end, all));
+        const parsed = parseJsonLoose(text);
+        if (start === 1) all = { title: parsed.title || "Tournament build-up", overview: parsed.overview || "", weeks: [] };
+        const got = (parsed.weeks || []).filter((w) => w && Array.isArray(w.sessions) && w.sessions.length);
+        if (!got.length) throw new Error(`no usable sessions for weeks ${start}-${end}`);
+        all.weeks = [...all.weeks, ...got];
+        setProgram({ ...all }); // weeks appear progressively as they're built
+        if (truncated) setError("Note: part of one reply was trimmed — check the block lists and redraft if a session looks thin.");
+      }
+      if (!all || !all.weeks.length) throw new Error("The AI's program had no weeks");
+    } catch (e) {
+      if (all && all.weeks.length) {
+        setError(`The coach stopped after week ${all.weeks[all.weeks.length - 1].n} (${e.message}). You can save what's here, or tap Build again for a fresh draft.`);
+      } else {
+        setError("The coach hit a problem: " + e.message + " — tap Build again to retry, or reduce sessions per week.");
+      }
+    } finally { setLoading(false); setProgressMsg(""); }
+  };
+
+  const saveProgram = () => {
+    const base = weekStart(new Date());
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const newExercises = [];
+    const newSessions = [];
+    program.weeks.forEach((w) => (w.sessions || []).forEach((ses) => {
+      const offset = (Number(w.n || 1) - 1) * 7 + (DAY_IDX[ses.day] ?? 2);
+      const dt = new Date(base.getTime() + offset * 86400000);
+      if (dt < today) return; // week 1 days already gone
+      const blocks = (ses.blocks || []).map(([ref, min]) => {
+        let ex = data.exercises.find((e) => e.id === ref)
+          || newExercises.find((e) => e.id === ref || e.name === String(ref));
+        if (!ex) {
+          ex = {
+            id: uid(), name: String(ref),
+            type: SESSION_TYPES.includes(ses.type) && ses.type !== "Mixed" ? ses.type : "Footwork drills",
+            categories: [], desc: "",
+          };
+          newExercises.push(ex);
+        }
+        return { exerciseId: ex.id, name: ex.name, minutes: Math.max(5, Math.round(min) || 15) };
+      });
+      newSessions.push({
+        id: uid(), date: localISO(dt),
+        title: ses.title || `${w.theme || "Training"} session`,
+        type: SESSION_TYPES.includes(ses.type) ? ses.type : "Mixed",
+        playerIds, duration: Math.min(180, Math.max(30, Math.round(ses.minutes) || 90)),
+        blocks, notes: `Week ${w.n} — ${w.theme || ""}`.trim(), status: "planned",
+      });
+    }));
+    update({ sessions: [...data.sessions, ...newSessions], exercises: [...data.exercises, ...newExercises] });
+    goTo("sessions");
+  };
+
+  return (
+    <div>
+      <p className="bth-coachintro">
+        A <strong>{weeks}-week</strong> program ending at {data.tournament.name} ({d} days away):
+        base building early, power and speed in the middle, sharpness and taper in the final week.
+        Every session lands on your calendar as an editable planned session.
+      </p>
+
+      <label className="bth-field">Anything to emphasize across the program?
+        <textarea rows={2} value={focus} placeholder="e.g. both boys need stronger smashes and faster rear-court recovery"
+          onChange={(e) => setFocus(e.target.value)} />
+      </label>
+
+      <div className="bth-formgrid">
+        <div className="bth-field">
+          <span className="bth-fieldlabel">On-court sessions / week</span>
+          <div className="bth-spw">
+            {[0, 1, 2, 3, 4, 5, 6].map((n) => (
+              <button key={n} className={"bth-cat" + (onCourt === n ? " on" : "")} onClick={() => setOnCourt(n)}>{n}</button>
+            ))}
+          </div>
+        </div>
+        <div className="bth-field">
+          <span className="bth-fieldlabel">Off-court / week (S&C, running)</span>
+          <div className="bth-spw">
+            {[0, 1, 2, 3, 4].map((n) => (
+              <button key={n} className={"bth-cat" + (offCourt === n ? " on" : "")} onClick={() => setOffCourt(n)}>{n}</button>
+            ))}
+          </div>
+        </div>
+        <div className="bth-field">
+          <span className="bth-fieldlabel">Training</span>
+          {data.players.map((p) => (
+            <button key={p.id} className={"bth-chip select" + (playerIds.includes(p.id) ? " on" : "")}
+              style={playerIds.includes(p.id) ? { borderColor: p.color } : {}} onClick={() => togglePlayer(p.id)}>
+              <span className="dot" style={{ background: p.color }} />{p.name}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <button className="bth-btn big" disabled={loading || playerIds.length === 0 || onCourt + offCourt === 0} onClick={generate}>
+        {loading ? (progressMsg || "Building the program…") : `Build ${weeks}-week program`}
+      </button>
+      {error && <p className="bth-error">{error}</p>}
+
+      {program && (
+        <div className="bth-plan">
+          <h3>{program.title}</h3>
+          <p className="bth-plan-rationale">{program.overview}</p>
+          {program.weeks.map((w) => (
+            <div key={w.n} className="bth-progweek">
+              <h4>Week {w.n} — {w.theme}</h4>
+              {(w.sessions || []).map((ses, i) => (
+                <div key={i} className="bth-progsession">
+                  <span className="bth-progday">{DAY_NAME[ses.day] || ses.day}</span>
+                  <strong>{ses.title}</strong>
+                  <span className="bth-sr-meta">{TYPE_SHORT[ses.type] || ses.type} · {ses.minutes} min</span>
+                  <span className="bth-sr-blocks">
+                    {(ses.blocks || []).map(([ref, min], j) => {
+                      const ex = data.exercises.find((e) => e.id === ref);
+                      return <span key={j} className="bth-block-pill">{ex ? ex.name : String(ref)} <em>{min}m</em></span>;
+                    })}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ))}
+          <div className="bth-editactions">
+            <button className="bth-btn ghost" onClick={generate}>Redraft</button>
+            <button className="bth-btn" onClick={saveProgram}>Save all as planned sessions</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Progress                                                            */
+/* ------------------------------------------------------------------ */
+
+function Progress({ data, meId }) {
+  const [range, setRange] = useState("week"); // week | month
+  const [playerId, setPlayerId] = useState(meId || "all");
+
+  const now = new Date();
+  const from = range === "week" ? weekStart(now) : new Date(now.getFullYear(), now.getMonth(), 1);
+
+  const done = data.sessions.filter((s) => s.status === "done" &&
+    parseDate(s.date) >= from &&
+    (playerId === "all" || s.playerIds.includes(playerId)));
+
+  const totalMin = done.reduce((a, s) => a + s.duration, 0);
+
+  const efforts = [];
+  done.forEach((s) => {
+    if (!s.feedback) return;
+    Object.entries(s.feedback).forEach(([pid, f]) => {
+      if ((playerId === "all" || pid === playerId) && f.effort) efforts.push(f.effort);
+    });
+  });
+  const avgEffort = efforts.length ? (efforts.reduce((a, b) => a + b, 0) / efforts.length).toFixed(1) : "–";
+
+  // Category minutes
+  const catMin = useMemo(() => {
+    const m = {};
+    for (const s of done) {
+      const blockTotal = s.blocks.reduce((a, b) => a + b.minutes, 0) || 1;
+      for (const b of s.blocks) {
+        const ex = data.exercises.find((e) => e.id === b.exerciseId);
+        const cats = ex?.categories?.length ? ex.categories : ["Uncategorized"];
+        const share = (b.minutes || 0) / cats.length;
+        cats.forEach((c) => { m[c] = (m[c] || 0) + share; });
+      }
+      if (s.blocks.length === 0) m["Unstructured"] = (m["Unstructured"] || 0) + s.duration;
+    }
+    return Object.entries(m).map(([name, min]) => ({ name, min: Math.round(min) })).sort((a, b) => b.min - a.min);
+  }, [done, data.exercises]);
+
+  // Weekly hours over last 8 weeks (all done sessions for trend, respecting player filter)
+  const trend = useMemo(() => {
+    const weeks = [];
+    for (let i = 7; i >= 0; i--) {
+      const start = new Date(weekStart(now).getTime() - i * 7 * 86400000);
+      const end = new Date(start.getTime() + 7 * 86400000);
+      const min = data.sessions
+        .filter((s) => s.status === "done" && (playerId === "all" || s.playerIds.includes(playerId)))
+        .filter((s) => { const dt = parseDate(s.date); return dt >= start && dt < end; })
+        .reduce((a, s) => a + s.duration, 0);
+      weeks.push({ week: fmtShort(start), hours: +(min / 60).toFixed(1) });
+    }
+    return weeks;
+  }, [data.sessions, playerId]);
+
+  const variety = catMin.length;
+  const encouragement =
+    done.length === 0 ? "Log a completed session and the charts light up." :
+    variety >= 6 ? `Great variety — ${variety} different areas trained. That's how all-round players are built.` :
+    variety >= 3 ? "Solid base. Try mixing in one category you haven't touched lately." :
+    "Heavy focus on a few areas — deliberate specialization or time to vary it up?";
+
+  return (
+    <div>
+      <div className="bth-panel-head standalone">
+        <h2>Progress</h2>
+        <div>
+          {["week", "month"].map((r) => (
+            <button key={r} className={"bth-tab mini" + (range === r ? " active" : "")} onClick={() => setRange(r)}>
+              {r === "week" ? "This week" : "This month"}
+            </button>
+          ))}
+          <select className="bth-playersel" value={playerId} onChange={(e) => setPlayerId(e.target.value)}>
+            <option value="all">Both players</option>
+            {data.players.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div className="bth-statrow">
+        <StatCard label="Sessions completed" value={done.length} sub={range === "week" ? "this week" : "this month"} />
+        <StatCard label="Training time" value={totalMin >= 60 ? (totalMin / 60).toFixed(1) + "h" : totalMin + "m"} sub="completed only" />
+        <StatCard label="Areas trained" value={variety} sub={`of ${CATEGORIES.length} categories`} />
+        <StatCard label="Avg effort" value={avgEffort} sub="🏸 1–5 scale" />
+      </div>
+
+      <p className="bth-encourage">{encouragement}</p>
+
+      <section className="bth-panel">
+        <div className="bth-panel-head"><h2>Where the minutes went</h2></div>
+        {catMin.length === 0 ? <p className="bth-empty">No completed session blocks in this range yet.</p> : (
+          <div style={{ width: "100%", height: Math.max(180, catMin.length * 36) }}>
+            <ResponsiveContainer>
+              <BarChart data={catMin} layout="vertical" margin={{ left: 10, right: 20 }}>
+                <XAxis type="number" tick={{ fontSize: 12 }} unit="m" />
+                <YAxis type="category" dataKey="name" width={150} tick={{ fontSize: 12 }} />
+                <Tooltip formatter={(v) => [v + " min"]} />
+                <Bar dataKey="min" fill="#1E3A5F" radius={[0, 4, 4, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </section>
+
+      <section className="bth-panel">
+        <div className="bth-panel-head"><h2>Weekly hours — last 8 weeks</h2></div>
+        <div style={{ width: "100%", height: 220 }}>
+          <ResponsiveContainer>
+            <LineChart data={trend} margin={{ left: 0, right: 20 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#DBE2EB" />
+              <XAxis dataKey="week" tick={{ fontSize: 12 }} />
+              <YAxis tick={{ fontSize: 12 }} unit="h" />
+              <Tooltip formatter={(v) => [v + " h"]} />
+              <Line type="monotone" dataKey="hours" stroke="#B24A2F" strokeWidth={2.5} dot={{ r: 3 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Styles                                                              */
+/* ------------------------------------------------------------------ */
+
+function StyleBlock() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+
+      .bth-root {
+        --court: #1E3A5F; --court-dark: #14273F;
+        --ink: #182131; --paper: #F3F5F8; --card: #FFFFFF;
+        --line: #DBE2EB; --smash: #C0512F; --muted: #5C6B7D;
+        min-height: 100vh; background: var(--paper); color: var(--ink);
+        font-family: 'Inter', system-ui, sans-serif; font-size: 15px; line-height: 1.5;
+      }
+      .bth-root * { box-sizing: border-box; }
+      .bth-root h1, .bth-root h2, .bth-root h3 {
+        font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif;
+        text-transform: uppercase; letter-spacing: 0.03em; margin: 0;
+      }
+
+      /* Header court */
+      .bth-court { position: relative; background: var(--court); color: #fff; overflow: hidden; }
+      .bth-courtlines { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0.28; }
+      .bth-court-inner {
+        position: relative; max-width: 960px; margin: 0 auto; padding: 26px 20px 30px;
+        display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; flex-wrap: wrap;
+      }
+      .bth-eyebrow { font-size: 12px; text-transform: uppercase; letter-spacing: 0.18em; opacity: 0.85; }
+      .bth-title { font-size: 52px; font-weight: 700; line-height: 1; margin: 2px 0 12px; }
+      .bth-players { display: flex; gap: 8px; flex-wrap: wrap; }
+      .bth-chip {
+        display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px;
+        border-radius: 999px; border: 2px solid rgba(255,255,255,0.5);
+        background: rgba(255,255,255,0.12); color: inherit; font: inherit; font-weight: 600; cursor: pointer;
+      }
+      .bth-chip .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+      .bth-chip.editing input { background: transparent; border: none; color: inherit; font: inherit; width: 110px; outline: none; border-bottom: 1px solid rgba(255,255,255,0.6); }
+      .bth-chip.editing { flex-wrap: wrap; }
+      .bth-swatches { display: flex; gap: 5px; align-items: center; margin-left: 6px; }
+      .bth-swatch { width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.6); cursor: pointer; padding: 0; outline-offset: 1px; }
+      .bth-chip.select { border-color: var(--line); background: #fff; color: var(--ink); opacity: 0.55; }
+      .bth-chip.select.on { opacity: 1; background: #fff; }
+
+      .bth-countdown {
+        display: flex; align-items: center; gap: 14px; cursor: pointer;
+        background: var(--smash); padding: 14px 18px; border-radius: 10px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.25); min-width: 210px;
+      }
+      .bth-count-num { font-family: 'Barlow Condensed', sans-serif; font-size: 54px; font-weight: 700; line-height: 0.9; }
+      .bth-count-label { font-size: 12.5px; line-height: 1.35; text-transform: uppercase; letter-spacing: 0.06em; }
+      .bth-count-label strong { font-size: 13.5px; }
+      .bth-count-date { display: block; opacity: 0.85; text-transform: none; letter-spacing: 0; }
+      .bth-count-empty { font-weight: 600; }
+      .bth-tourney-edit { display: flex; flex-direction: column; gap: 6px; }
+      .bth-tourney-edit input { border: none; border-radius: 6px; padding: 6px 8px; font: inherit; }
+      .bth-save { position: absolute; right: 12px; top: 8px; font-size: 11px; opacity: 0.8; text-align: right; max-width: 60%; }
+      .bth-savehelp {
+        position: relative; z-index: 2; background: var(--smash); color: #fff; font-size: 13px;
+        padding: 8px 20px; text-align: center;
+      }
+      .bth-savehelp button {
+        background: #fff; color: var(--smash); border: none; border-radius: 6px; font-weight: 700;
+        padding: 3px 10px; margin: 0 6px; cursor: pointer; font: inherit;
+      }
+      .bth-restoreline { margin-top: 18px; text-align: center; }
+      .bth-linkbtn.light { color: #fff; opacity: 0.85; text-decoration: underline; }
+
+      /* Nav */
+      .bth-nav {
+        position: sticky; top: 0; z-index: 10; background: var(--court-dark);
+        display: flex; gap: 2px; overflow-x: auto; padding: 0 max(12px, calc((100% - 960px)/2));
+      }
+      .bth-tab {
+        font-family: 'Barlow Condensed', sans-serif; text-transform: uppercase; letter-spacing: 0.06em;
+        font-size: 17px; font-weight: 600; color: rgba(255,255,255,0.75);
+        background: none; border: none; padding: 12px 16px 10px; cursor: pointer;
+        border-bottom: 3px solid transparent; white-space: nowrap;
+      }
+      .bth-tab.active { color: #fff; border-bottom-color: var(--smash); }
+      .bth-tab:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+      .bth-tab.mini { color: var(--muted); font-size: 15px; padding: 6px 10px; border-bottom-width: 2px; }
+      .bth-tab.mini.active { color: var(--ink); border-bottom-color: var(--smash); }
+
+      .bth-main { max-width: 960px; margin: 0 auto; padding: 22px 16px 60px; }
+
+      /* Panels & stats */
+      .bth-panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+      .bth-panel-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+      .bth-panel-head.standalone { margin: 4px 0 14px; }
+      .bth-panel-head h2 { font-size: 24px; }
+      .bth-panel-head > div { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .bth-statrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+      .bth-stat { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--court); border-radius: 10px; padding: 12px 14px; }
+      .bth-stat-value { font-family: 'Barlow Condensed', sans-serif; font-size: 34px; font-weight: 700; line-height: 1; }
+      .bth-stat-label { font-weight: 600; font-size: 13px; margin-top: 3px; }
+      .bth-stat-sub { color: var(--muted); font-size: 12px; }
+      .bth-empty { color: var(--muted); font-size: 14px; margin: 6px 0; }
+      .bth-encourage { background: #E9EEF6; border-left: 4px solid var(--court); padding: 10px 14px; border-radius: 8px; font-weight: 500; margin: 0 0 18px; }
+      .bth-error { color: var(--smash); font-weight: 500; }
+
+      /* Buttons */
+      .bth-btn {
+        font: inherit; font-weight: 600; background: var(--court); color: #fff;
+        border: 1px solid var(--court); border-radius: 8px; padding: 8px 14px; cursor: pointer;
+      }
+      .bth-btn:hover { background: var(--court-dark); }
+      .bth-btn:disabled { opacity: 0.5; cursor: default; }
+      .bth-btn.ghost { background: transparent; color: var(--court); }
+      .bth-btn.small { padding: 4px 10px; font-size: 13px; }
+      .bth-btn.big { width: 100%; padding: 12px; font-size: 16px; }
+      .bth-btn.danger { background: transparent; border-color: var(--line); color: var(--smash); }
+      .bth-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+      /* Session rows */
+      .bth-sessionrow {
+        display: flex; gap: 14px; padding: 12px; border: 1px solid var(--line);
+        border-radius: 10px; margin-bottom: 10px; background: var(--card); flex-wrap: wrap;
+      }
+      .bth-sessionrow.done { background: #F6FAF7; }
+      .bth-sr-date { display: flex; flex-direction: column; gap: 4px; min-width: 92px; font-weight: 600; font-size: 13.5px; }
+      .bth-sr-type { align-self: flex-start; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; background: var(--court); color: #fff; padding: 2px 7px; border-radius: 4px; }
+      .bth-sr-main { flex: 1; min-width: 220px; }
+      .bth-sr-title { font-weight: 600; }
+      .bth-sr-meta { color: var(--muted); font-size: 13px; }
+      .bth-sr-blocks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+      .bth-block-pill { font-size: 12px; background: var(--paper); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; }
+      .bth-block-pill em { color: var(--muted); font-style: normal; }
+      .bth-sr-notes { font-size: 13px; color: var(--muted); margin-top: 6px; }
+      .bth-sr-actions { display: flex; gap: 6px; align-items: flex-start; }
+      .bth-donebadge { color: var(--court); font-weight: 700; font-size: 13px; padding-top: 5px; }
+
+      /* Forms */
+      .bth-formgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 14px; }
+      .bth-root label { display: flex; flex-direction: column; gap: 5px; font-weight: 600; font-size: 13.5px; }
+      .bth-root input[type=text], .bth-root input:not([type]), .bth-root input[type=date], .bth-root input[type=number],
+      .bth-root select, .bth-root textarea {
+        font: inherit; font-weight: 400; border: 1px solid var(--line); border-radius: 8px;
+        padding: 8px 10px; background: #fff; color: var(--ink);
+      }
+      .bth-root input[type=range] { accent-color: var(--court); }
+      .bth-field { margin-bottom: 14px; display: block; }
+      .bth-fieldlabel { display: block; font-weight: 600; font-size: 13.5px; margin-bottom: 6px; }
+      .bth-warn { color: var(--smash); font-style: normal; }
+      .bth-blockrow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 14px; }
+      .bth-blockname { flex: 1; font-weight: 500; }
+      .bth-blockrow input { width: 64px; }
+      .bth-picker { border: 1px solid var(--line); border-radius: 10px; margin-top: 8px; max-height: 240px; overflow-y: auto; }
+      .bth-pickitem { display: flex; justify-content: space-between; width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--line); padding: 9px 12px; font: inherit; cursor: pointer; }
+      .bth-pickitem:hover { background: var(--paper); }
+      .bth-pickitem span { color: var(--muted); font-size: 12.5px; }
+      .bth-editactions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+
+      /* Exercise bank */
+      .bth-search { width: 100%; margin-bottom: 10px; }
+      .bth-catrow { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 12px; }
+      .bth-catrow.wrap { flex-wrap: wrap; overflow: visible; }
+      .bth-cat {
+        font: inherit; font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer;
+        border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 4px 12px; color: var(--muted);
+      }
+      .bth-cat.on { background: var(--court); border-color: var(--court); color: #fff; }
+      .bth-exgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+      .bth-excard { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 7px; }
+      .bth-excard h3 { font-size: 19px; }
+      .bth-excard p { margin: 0; font-size: 13.5px; color: var(--muted); flex: 1; }
+      .bth-ex-type { align-self: flex-start; font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; background: var(--paper); border: 1px solid var(--line); border-radius: 4px; padding: 2px 7px; color: var(--muted); }
+      .bth-ex-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+      .bth-ex-tags span { font-size: 11.5px; background: #E9EEF6; color: var(--court-dark); border-radius: 999px; padding: 2px 8px; }
+      .bth-ex-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+      /* AI coach */
+      .bth-testline { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+      .bth-linkbtn { background: none; border: none; color: var(--court); text-decoration: underline; cursor: pointer; font: inherit; font-size: 13px; padding: 0; }
+      .bth-coachintro { color: var(--muted); margin-top: 0; }
+      .bth-plan { margin-top: 18px; border-top: 2px dashed var(--line); padding-top: 14px; }
+      .bth-plan h3 { font-size: 22px; }
+      .bth-plan-rationale { color: var(--muted); }
+      .bth-planblock { border: 1px solid var(--line); border-left: 4px solid var(--smash); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+      .bth-planblock-head { display: flex; justify-content: space-between; gap: 10px; }
+      .bth-planblock p { margin: 4px 0 0; font-size: 13.5px; color: var(--muted); }
+
+      .bth-playersel { padding: 6px 8px; }
+
+      /* Profile picker */
+      .bth-picker-screen { min-height: 100vh; background: var(--court); display: grid; place-items: center; padding: 20px; position: relative; }
+      .bth-picker-card { width: 100%; max-width: 420px; color: #fff; }
+      .bth-picker-card h1 { font-size: 44px; margin: 4px 0 20px; }
+      .bth-picker-opts { display: flex; flex-direction: column; gap: 10px; }
+      .bth-picker-btn {
+        font: inherit; text-align: left; cursor: pointer; color: #fff;
+        background: rgba(255,255,255,0.12); border: 2px solid rgba(255,255,255,0.5);
+        border-radius: 12px; padding: 14px 16px; font-weight: 700; font-size: 17px;
+        display: flex; flex-direction: column; gap: 2px;
+      }
+      .bth-picker-btn small { font-weight: 400; font-size: 13px; opacity: 0.85; }
+      .bth-picker-btn .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+      .bth-picker-btn.coach { background: var(--smash); border-color: var(--smash); }
+      .bth-picker-btn:hover { background: rgba(255,255,255,0.22); }
+      .bth-picker-btn.coach:hover { background: #9c3f27; }
+      .bth-picker-opts label { color: #fff; }
+      .bth-picker-opts input { font: inherit; border: none; border-radius: 8px; padding: 10px 12px; }
+      .bth-btn.smash { background: var(--smash); border-color: var(--smash); }
+      .bth-btn.ghost.light { color: #fff; border-color: rgba(255,255,255,0.5); }
+
+      .bth-whoami { margin-top: 10px; font-size: 13px; opacity: 0.9; }
+      .bth-whoami button { background: none; border: none; color: #fff; text-decoration: underline; cursor: pointer; font: inherit; font-size: 13px; margin-left: 8px; opacity: 0.85; }
+      .bth-countdown.readonly { cursor: default; }
+
+      /* Feedback & completion */
+      .bth-sr-feedback { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 6px; font-size: 13px; }
+      .bth-overlay { position: fixed; inset: 0; background: rgba(15,25,42,0.55); display: grid; place-items: center; z-index: 50; padding: 16px; }
+      .bth-modal { background: #fff; border-radius: 14px; padding: 20px; width: 100%; max-width: 460px; box-shadow: 0 12px 40px rgba(0,0,0,0.3); }
+      .bth-modal h3 { font-size: 24px; }
+      .bth-modal-sub { color: var(--muted); margin: 4px 0 14px; }
+      .bth-fbrow { margin-bottom: 14px; display: flex; flex-direction: column; gap: 6px; }
+      .bth-fbname { font-weight: 600; display: flex; align-items: center; gap: 7px; }
+      .bth-fbname .dot { width: 9px; height: 9px; border-radius: 50%; }
+      .bth-effort { display: flex; align-items: center; gap: 2px; }
+      .bth-effbtn { font-size: 20px; background: none; border: none; cursor: pointer; filter: grayscale(1); opacity: 0.35; padding: 2px; }
+      .bth-effbtn.on { filter: none; opacity: 1; }
+      .bth-effbtn:focus-visible { outline: 2px solid var(--ink); border-radius: 4px; }
+      .bth-efflabel { margin-left: 8px; font-size: 13px; color: var(--muted); }
+
+      /* Program builder */
+      .bth-progweek { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+      .bth-progweek h4 { margin: 0 0 6px; font-family: 'Barlow Condensed', sans-serif; text-transform: uppercase; letter-spacing: 0.04em; font-size: 18px; }
+      .bth-progsession { display: flex; gap: 8px 12px; flex-wrap: wrap; align-items: baseline; padding: 7px 0; border-top: 1px dashed var(--line); font-size: 14px; }
+      .bth-progday { font-weight: 700; min-width: 36px; color: var(--court-dark); }
+      .bth-spw { display: flex; gap: 6px; }
+
+      /* Print sheet */
+      .bth-sheetwrap { max-width: 800px; margin: 0 auto; padding: 18px 16px 60px; }
+      .bth-sheetbar { display: flex; justify-content: space-between; margin-bottom: 14px; }
+      .bth-sheet { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 26px; }
+      .bth-sheet-head { display: flex; justify-content: space-between; gap: 16px; border-bottom: 3px solid var(--court); padding-bottom: 12px; margin-bottom: 14px; }
+      .bth-sheet-eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: 0.16em; color: var(--muted); }
+      .bth-sheet h1 { font-size: 34px; }
+      .bth-sheet-meta { color: var(--muted); font-size: 14px; margin-top: 4px; }
+      .bth-sheet-count { text-align: center; font-family: 'Barlow Condensed', sans-serif; font-size: 44px; font-weight: 700; color: var(--smash); line-height: 0.9; }
+      .bth-sheet-count span { display: block; font-family: 'Inter', sans-serif; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink); margin-top: 5px; }
+      .bth-sheet-table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+      .bth-sheet-table th, .bth-sheet-table td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; font-size: 14px; vertical-align: top; }
+      .bth-sheet-table th { background: var(--paper); font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+      .bth-sheet-check { text-align: center; font-size: 18px; }
+      .bth-sheet-desc { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+      .bth-sheet-notes { font-size: 14px; margin-bottom: 14px; }
+      .bth-sheet-effort { font-size: 14px; display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+      .bth-sheet-lines strong { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; }
+      .bth-sheet-lines div { border-bottom: 1px solid var(--line); height: 26px; }
+
+      @media print {
+        .bth-noprint { display: none !important; }
+        .bth-root { background: #fff; }
+        .bth-sheetwrap { padding: 0; max-width: none; }
+        .bth-sheet { border: none; border-radius: 0; padding: 0; }
+      }
+
+      @media (max-width: 560px) {
+        .bth-title { font-size: 40px; }
+        .bth-countdown { width: 100%; }
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .bth-btn, .bth-tab, .bth-cat { transition: background 0.15s, color 0.15s, opacity 0.15s; }
+      }
+    `}</style>
+  );
+}
