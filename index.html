@@ -298,6 +298,9 @@ const DEFAULT_DATA = {
   sessions: [],
   tournament: { name: "Next tournament", date: "" },
   settings: { coachPin: "" },
+  types: SESSION_TYPES.filter((t) => t !== "Mixed"),
+  // exercise/session types; "Mixed" is a fixed session-only extra
+  categories: [...CATEGORIES],
   seedVersion: SEED_VERSION,
   updatedAt: 0
 };
@@ -308,6 +311,8 @@ const normalize = (d) => {
     players: d.players && d.players.length ? d.players : DEFAULT_DATA.players,
     tournament: { name: "Next tournament", date: "", ...d.tournament || {} },
     settings: { coachPin: "", ...d.settings || {} },
+    types: d.types && d.types.length ? d.types : DEFAULT_DATA.types,
+    categories: d.categories && d.categories.length ? d.categories : DEFAULT_DATA.categories,
     updatedAt: d.updatedAt || 0
   };
   base.players = (base.players || []).map((p) => {
@@ -324,6 +329,7 @@ const normalize = (d) => {
   }
   return base;
 };
+const shortLabel = (type) => TYPE_SHORT[type] || type;
 function parseDate(s) {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d);
@@ -355,8 +361,10 @@ function BadmintonTrainingHub() {
   const [printing, setPrinting] = useState(null);
   const [slowLoad, setSlowLoad] = useState(false);
   const [loadTick, setLoadTick] = useState(0);
+  const readyRef = React.useRef(false);
   useEffect(() => {
     let cancelled = false;
+    readyRef.current = false;
     setSlowLoad(false);
     const timer = setTimeout(() => setSlowLoad(true), 6e3);
     (async () => {
@@ -376,6 +384,8 @@ function BadmintonTrainingHub() {
           localStorage.setItem(CACHE_KEY, JSON.stringify(merged));
         }
       } catch (e) {
+      } finally {
+        if (!cancelled) readyRef.current = true;
       }
     })().finally(() => clearTimeout(timer));
     return () => {
@@ -384,7 +394,7 @@ function BadmintonTrainingHub() {
     };
   }, [loadTick]);
   useEffect(() => {
-    if (!data) return;
+    if (!data || !readyRef.current) return;
     const t = setTimeout(async () => {
       setSaveState("saving");
       const payload = JSON.stringify(data);
@@ -442,7 +452,8 @@ function BadmintonTrainingHub() {
       saveErrDetail,
       isCoach,
       me,
-      onSwitch: () => setProfile(null)
+      onSwitch: () => setProfile(null),
+      onRefresh: () => setLoadTick((t) => t + 1)
     }
   ), /* @__PURE__ */ React.createElement("nav", { className: "bth-nav", "aria-label": "Sections" }, tabs.map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, className: "bth-tab" + (tab === id ? " active" : ""), onClick: () => setTab(id) }, label))), /* @__PURE__ */ React.createElement("main", { className: "bth-main" }, tab === "dashboard" && /* @__PURE__ */ React.createElement(Dashboard, { data, update, goTo: setTab, onPrint: setPrinting, isCoach, meId }), tab === "sessions" && /* @__PURE__ */ React.createElement(Sessions, { data, update, onPrint: setPrinting, isCoach, meId }), tab === "exercises" && /* @__PURE__ */ React.createElement(ExerciseBank, { data, update, isCoach }), tab === "coach" && isCoach && /* @__PURE__ */ React.createElement(AICoach, { data, update, goTo: setTab }), tab === "progress" && /* @__PURE__ */ React.createElement(Progress, { data, meId })));
 }
@@ -511,9 +522,15 @@ function ProfilePicker({ data, update, onPick }) {
     }
   )), err && stage === "pick" && /* @__PURE__ */ React.createElement("p", { className: "bth-error" }, err)));
 }
-function CourtHeader({ data, update, saveState, saveErrDetail, isCoach, me, onSwitch }) {
+function CourtHeader({ data, update, saveState, saveErrDetail, isCoach, me, onSwitch, onRefresh }) {
   const [editing, setEditing] = useState(false);
+  const [justSynced, setJustSynced] = useState(false);
   const d = daysUntil(data.tournament.date);
+  const handleRefresh = () => {
+    onRefresh();
+    setJustSynced(true);
+    setTimeout(() => setJustSynced(false), 2e3);
+  };
   return /* @__PURE__ */ React.createElement("header", { className: "bth-court" }, /* @__PURE__ */ React.createElement("svg", { className: "bth-courtlines", viewBox: "0 0 800 190", preserveAspectRatio: "none", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("rect", { x: "8", y: "8", width: "784", height: "174", fill: "none", stroke: "#fff", strokeWidth: "3" }), /* @__PURE__ */ React.createElement("line", { x1: "8", y1: "30", x2: "792", y2: "30", stroke: "#fff", strokeWidth: "2" }), /* @__PURE__ */ React.createElement("line", { x1: "8", y1: "160", x2: "792", y2: "160", stroke: "#fff", strokeWidth: "2" }), /* @__PURE__ */ React.createElement("line", { x1: "400", y1: "8", x2: "400", y2: "70", stroke: "#fff", strokeWidth: "2" }), /* @__PURE__ */ React.createElement("line", { x1: "400", y1: "120", x2: "400", y2: "182", stroke: "#fff", strokeWidth: "2" }), /* @__PURE__ */ React.createElement("line", { x1: "8", y1: "70", x2: "792", y2: "70", stroke: "#fff", strokeWidth: "2" }), /* @__PURE__ */ React.createElement("line", { x1: "8", y1: "120", x2: "792", y2: "120", stroke: "#fff", strokeWidth: "2" }), /* @__PURE__ */ React.createElement("line", { x1: "300", y1: "0", x2: "300", y2: "190", stroke: "#fff", strokeWidth: "1", strokeDasharray: "6 6", opacity: "0.5" })), /* @__PURE__ */ React.createElement("div", { className: "bth-court-inner" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "bth-eyebrow" }, "Family training hub"), /* @__PURE__ */ React.createElement("h1", { className: "bth-title" }, "Shuttle\xA0Time"), /* @__PURE__ */ React.createElement("div", { className: "bth-players" }, data.players.map((p) => /* @__PURE__ */ React.createElement(
     PlayerChip,
     {
@@ -521,9 +538,18 @@ function CourtHeader({ data, update, saveState, saveErrDetail, isCoach, me, onSw
       player: p,
       canEdit: isCoach,
       onRename: (name) => update({ players: data.players.map((x) => x.id === p.id ? { ...x, name } : x) }),
-      onRecolor: (color) => update({ players: data.players.map((x) => x.id === p.id ? { ...x, color } : x) })
+      onRecolor: (color) => update({ players: data.players.map((x) => x.id === p.id ? { ...x, color } : x) }),
+      onRemove: data.players.length > 1 ? () => {
+        if (!window.confirm(`Remove ${p.name}? Past sessions stay in history, but they'll no longer show up under an active profile.`)) return;
+        update({ players: data.players.filter((x) => x.id !== p.id) });
+      } : void 0
     }
-  ))), /* @__PURE__ */ React.createElement("div", { className: "bth-whoami" }, "On court as ", /* @__PURE__ */ React.createElement("strong", null, isCoach ? "Coach" : me?.name), /* @__PURE__ */ React.createElement("button", { onClick: onSwitch }, "switch"))), /* @__PURE__ */ React.createElement(
+  )), isCoach && /* @__PURE__ */ React.createElement("button", { className: "bth-chip addplayer", onClick: () => {
+    const used = new Set(data.players.map((p) => p.color));
+    const color = PLAYER_COLORS.find((c) => !used.has(c)) || PLAYER_COLORS[data.players.length % PLAYER_COLORS.length];
+    const id = uid();
+    update({ players: [...data.players, { id, name: "New player", color }] });
+  } }, "\uFF0B Add player")), /* @__PURE__ */ React.createElement("div", { className: "bth-whoami" }, "On court as ", /* @__PURE__ */ React.createElement("strong", null, isCoach ? "Coach" : me?.name), /* @__PURE__ */ React.createElement("button", { onClick: onSwitch }, "switch"))), /* @__PURE__ */ React.createElement(
     "div",
     {
       className: "bth-countdown" + (isCoach ? "" : " readonly"),
@@ -547,7 +573,7 @@ function CourtHeader({ data, update, saveState, saveErrDetail, isCoach, me, onSw
         onChange: (e) => update({ tournament: { ...data.tournament, date: e.target.value } })
       }
     ), /* @__PURE__ */ React.createElement("button", { className: "bth-btn small", onClick: () => setEditing(false) }, "Done")) : d === null ? /* @__PURE__ */ React.createElement("div", { className: "bth-count-empty" }, isCoach ? "\uFF0B Set next tournament date" : "No tournament set yet") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "bth-count-num" }, d >= 0 ? d : "\u2013"), /* @__PURE__ */ React.createElement("div", { className: "bth-count-label" }, d >= 0 ? "days to" : "days since", /* @__PURE__ */ React.createElement("br", null), /* @__PURE__ */ React.createElement("strong", null, data.tournament.name || "tournament"), /* @__PURE__ */ React.createElement("span", { className: "bth-count-date" }, fmtDateStr(data.tournament.date))))
-  )), /* @__PURE__ */ React.createElement("div", { className: "bth-save " + saveState }, saveState === "saving" ? "Saving\u2026" : saveState === "saved" ? "Saved \u2713 (synced to Sheet)" : saveState === "local" ? "Saved on this device \u2014 Sheet sync pending" : saveState === "error" ? `Couldn't save: ${saveErrDetail || "unknown error"}` : ""), saveState === "error" && /* @__PURE__ */ React.createElement("div", { className: "bth-savehelp" }, "Your changes aren't being stored right now, so don't rely on this session.", /* @__PURE__ */ React.createElement("button", { onClick: () => {
+  )), /* @__PURE__ */ React.createElement("div", { className: "bth-syncrow" }, /* @__PURE__ */ React.createElement("button", { className: "bth-syncbtn", onClick: handleRefresh }, justSynced ? "\u21BB Pulled latest \u2713" : "\u21BB Sync now"), /* @__PURE__ */ React.createElement("div", { className: "bth-save " + saveState }, saveState === "saving" ? "Saving\u2026" : saveState === "saved" ? "Saved \u2713 (synced to Sheet)" : saveState === "local" ? "Saved on this device \u2014 Sheet sync pending" : saveState === "error" ? `Couldn't save: ${saveErrDetail || "unknown error"}` : "")), saveState === "error" && /* @__PURE__ */ React.createElement("div", { className: "bth-savehelp" }, "Your changes aren't being stored right now, so don't rely on this session.", /* @__PURE__ */ React.createElement("button", { onClick: () => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -557,23 +583,24 @@ function CourtHeader({ data, update, saveState, saveErrDetail, isCoach, me, onSw
     URL.revokeObjectURL(url);
   } }, "Download a backup now"), "\u2014 try reloading the page, or check your internet connection."));
 }
-function PlayerChip({ player, canEdit, onRename, onRecolor }) {
-  const [editing, setEditing] = useState(false);
-  const [val, setVal] = useState(player.name);
+function PlayerChip({ player, canEdit, onRename, onRecolor, onRemove }) {
+  const [editing, setEditing] = useState(player.name === "New player");
+  const [val, setVal] = useState(player.name === "New player" ? "" : player.name);
   if (editing && canEdit) {
     return /* @__PURE__ */ React.createElement("span", { className: "bth-chip editing" }, /* @__PURE__ */ React.createElement(
       "input",
       {
         autoFocus: true,
         value: val,
+        placeholder: "Name",
         onChange: (e) => setVal(e.target.value),
         onBlur: () => {
-          onRename(val.trim() || player.name);
+          if (val.trim()) onRename(val.trim());
           setEditing(false);
         },
         onKeyDown: (e) => {
           if (e.key === "Enter") {
-            onRename(val.trim() || player.name);
+            if (val.trim()) onRename(val.trim());
             setEditing(false);
           }
         }
@@ -588,7 +615,16 @@ function PlayerChip({ player, canEdit, onRename, onRecolor }) {
         onMouseDown: (e) => e.preventDefault(),
         onClick: () => onRecolor(c)
       }
-    ))));
+    ))), onRemove && /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        className: "bth-chip-remove",
+        "aria-label": "Remove " + player.name,
+        onMouseDown: (e) => e.preventDefault(),
+        onClick: onRemove
+      },
+      "\u2715"
+    ));
   }
   return /* @__PURE__ */ React.createElement(
     "button",
@@ -645,7 +681,7 @@ function StatCard({ label, value, sub }) {
 function SessionRow({ s, data, onDone, onEdit, onDelete, onPrint, onRate }) {
   const names = s.playerIds.map((id) => data.players.find((p) => p.id === id)?.name).filter(Boolean).join(" + ");
   const feedback = s.feedback && Object.entries(s.feedback).map(([pid, f]) => ({ p: data.players.find((x) => x.id === pid), f })).filter((x) => x.p);
-  return /* @__PURE__ */ React.createElement("div", { className: "bth-sessionrow " + s.status }, /* @__PURE__ */ React.createElement("div", { className: "bth-sr-date" }, /* @__PURE__ */ React.createElement("span", null, fmtDateStr(s.date)), /* @__PURE__ */ React.createElement("span", { className: "bth-sr-type" }, TYPE_SHORT[s.type] || s.type)), /* @__PURE__ */ React.createElement("div", { className: "bth-sr-main" }, /* @__PURE__ */ React.createElement("div", { className: "bth-sr-title" }, s.title), /* @__PURE__ */ React.createElement("div", { className: "bth-sr-meta" }, names, " \xB7 ", s.duration, " min \xB7 ", s.blocks.length, " block", s.blocks.length !== 1 ? "s" : ""), s.blocks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "bth-sr-blocks" }, s.blocks.map((b, i) => /* @__PURE__ */ React.createElement("span", { key: i, className: "bth-block-pill" }, b.name, " ", /* @__PURE__ */ React.createElement("em", null, b.minutes, "m")))), s.notes && /* @__PURE__ */ React.createElement("div", { className: "bth-sr-notes" }, s.notes), feedback && feedback.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "bth-sr-feedback" }, feedback.map(({ p, f }) => /* @__PURE__ */ React.createElement("span", { key: p.id }, /* @__PURE__ */ React.createElement("strong", null, p.name), " ", "\u{1F3F8}".repeat(f.effort || 0), f.note ? ` \u2014 ${f.note}` : "")))), /* @__PURE__ */ React.createElement("div", { className: "bth-sr-actions" }, s.status === "planned" && onDone && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small", onClick: onDone }, "Mark done"), s.status === "done" && /* @__PURE__ */ React.createElement("span", { className: "bth-donebadge" }, "Done \u2713"), onRate && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small", onClick: onRate }, "Add my rating"), onPrint && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small ghost", onClick: onPrint }, "Print"), onEdit && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small ghost", onClick: onEdit }, "Edit"), onDelete && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small danger", onClick: onDelete }, "Delete")));
+  return /* @__PURE__ */ React.createElement("div", { className: "bth-sessionrow " + s.status }, /* @__PURE__ */ React.createElement("div", { className: "bth-sr-date" }, /* @__PURE__ */ React.createElement("span", null, fmtDateStr(s.date)), /* @__PURE__ */ React.createElement("span", { className: "bth-sr-type" }, shortLabel(s.type))), /* @__PURE__ */ React.createElement("div", { className: "bth-sr-main" }, /* @__PURE__ */ React.createElement("div", { className: "bth-sr-title" }, s.title), /* @__PURE__ */ React.createElement("div", { className: "bth-sr-meta" }, names, " \xB7 ", s.duration, " min \xB7 ", s.blocks.length, " block", s.blocks.length !== 1 ? "s" : ""), s.blocks.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "bth-sr-blocks" }, s.blocks.map((b, i) => /* @__PURE__ */ React.createElement("span", { key: i, className: "bth-block-pill" }, b.name, " ", /* @__PURE__ */ React.createElement("em", null, b.minutes, "m")))), s.notes && /* @__PURE__ */ React.createElement("div", { className: "bth-sr-notes" }, s.notes), feedback && feedback.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "bth-sr-feedback" }, feedback.map(({ p, f }) => /* @__PURE__ */ React.createElement("span", { key: p.id }, /* @__PURE__ */ React.createElement("strong", null, p.name), " ", "\u{1F3F8}".repeat(f.effort || 0), f.note ? ` \u2014 ${f.note}` : "")))), /* @__PURE__ */ React.createElement("div", { className: "bth-sr-actions" }, s.status === "planned" && onDone && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small", onClick: onDone }, "Mark done"), s.status === "done" && /* @__PURE__ */ React.createElement("span", { className: "bth-donebadge" }, "Done \u2713"), onRate && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small", onClick: onRate }, "Add my rating"), onPrint && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small ghost", onClick: onPrint }, "Print"), onEdit && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small ghost", onClick: onEdit }, "Edit"), onDelete && /* @__PURE__ */ React.createElement("button", { className: "bth-btn small danger", onClick: onDelete }, "Delete")));
 }
 function CompleteSession({ session, data, onSave, onCancel, ratePlayerIds }) {
   const ids = (ratePlayerIds && ratePlayerIds.length ? ratePlayerIds : session.playerIds).filter(Boolean);
@@ -755,7 +791,7 @@ function SessionEditor({ data, session, onSave, onCancel }) {
     set({ blocks: [...s.blocks, { exerciseId: ex.id, name: ex.name, minutes: 15 }] });
     setPickerOpen(false);
   };
-  return /* @__PURE__ */ React.createElement("div", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, data.sessions.some((x) => x.id === s.id) ? "Edit session" : "New session")), /* @__PURE__ */ React.createElement("div", { className: "bth-formgrid" }, /* @__PURE__ */ React.createElement("label", null, "Title", /* @__PURE__ */ React.createElement("input", { value: s.title, placeholder: "e.g. Tuesday footwork + net play", onChange: (e) => set({ title: e.target.value }) })), /* @__PURE__ */ React.createElement("label", null, "Date", /* @__PURE__ */ React.createElement("input", { type: "date", value: s.date, onChange: (e) => set({ date: e.target.value }) })), /* @__PURE__ */ React.createElement("label", null, "Session type", /* @__PURE__ */ React.createElement("select", { value: s.type, onChange: (e) => set({ type: e.target.value }) }, SESSION_TYPES.map((t) => /* @__PURE__ */ React.createElement("option", { key: t }, t)))), /* @__PURE__ */ React.createElement("label", null, "Duration: ", /* @__PURE__ */ React.createElement("strong", null, s.duration, " min"), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, data.sessions.some((x) => x.id === s.id) ? "Edit session" : "New session")), /* @__PURE__ */ React.createElement("div", { className: "bth-formgrid" }, /* @__PURE__ */ React.createElement("label", null, "Title", /* @__PURE__ */ React.createElement("input", { value: s.title, placeholder: "e.g. Tuesday footwork + net play", onChange: (e) => set({ title: e.target.value }) })), /* @__PURE__ */ React.createElement("label", null, "Date", /* @__PURE__ */ React.createElement("input", { type: "date", value: s.date, onChange: (e) => set({ date: e.target.value }) })), /* @__PURE__ */ React.createElement("label", null, "Session type", /* @__PURE__ */ React.createElement("select", { value: s.type, onChange: (e) => set({ type: e.target.value }) }, [...data.types, "Mixed"].map((t) => /* @__PURE__ */ React.createElement("option", { key: t }, t)))), /* @__PURE__ */ React.createElement("label", null, "Duration: ", /* @__PURE__ */ React.createElement("strong", null, s.duration, " min"), /* @__PURE__ */ React.createElement(
     "input",
     {
       type: "range",
@@ -784,7 +820,7 @@ function SessionEditor({ data, session, onSave, onCancel }) {
       value: b.minutes,
       onChange: (e) => set({ blocks: s.blocks.map((x, j) => j === i ? { ...x, minutes: Number(e.target.value) } : x) })
     }
-  ), " min", /* @__PURE__ */ React.createElement("button", { className: "bth-btn small danger", onClick: () => set({ blocks: s.blocks.filter((_, j) => j !== i) }) }, "\u2715"))), /* @__PURE__ */ React.createElement("button", { className: "bth-btn ghost", onClick: () => setPickerOpen((o) => !o) }, "\uFF0B Add exercise block"), pickerOpen && /* @__PURE__ */ React.createElement("div", { className: "bth-picker" }, data.exercises.map((ex) => /* @__PURE__ */ React.createElement("button", { key: ex.id, className: "bth-pickitem", onClick: () => addBlock(ex) }, /* @__PURE__ */ React.createElement("strong", null, ex.name), " ", /* @__PURE__ */ React.createElement("span", null, TYPE_SHORT[ex.type]))))), /* @__PURE__ */ React.createElement("label", { className: "bth-field" }, "Notes", /* @__PURE__ */ React.createElement(
+  ), " min", /* @__PURE__ */ React.createElement("button", { className: "bth-btn small danger", onClick: () => set({ blocks: s.blocks.filter((_, j) => j !== i) }) }, "\u2715"))), /* @__PURE__ */ React.createElement("button", { className: "bth-btn ghost", onClick: () => setPickerOpen((o) => !o) }, "\uFF0B Add exercise block"), pickerOpen && /* @__PURE__ */ React.createElement("div", { className: "bth-picker" }, data.exercises.map((ex) => /* @__PURE__ */ React.createElement("button", { key: ex.id, className: "bth-pickitem", onClick: () => addBlock(ex) }, /* @__PURE__ */ React.createElement("strong", null, ex.name), " ", /* @__PURE__ */ React.createElement("span", null, shortLabel(ex.type)))))), /* @__PURE__ */ React.createElement("label", { className: "bth-field" }, "Notes", /* @__PURE__ */ React.createElement(
     "textarea",
     {
       rows: 2,
@@ -797,7 +833,7 @@ function SessionEditor({ data, session, onSave, onCancel }) {
     {
       className: "bth-btn",
       disabled: s.playerIds.length === 0,
-      onClick: () => onSave({ ...s, title: s.title.trim() || `${TYPE_SHORT[s.type]} session` })
+      onClick: () => onSave({ ...s, title: s.title.trim() || `${shortLabel(s.type)} session` })
     },
     "Save session"
   )));
@@ -806,6 +842,12 @@ function ExerciseBank({ data, update, isCoach }) {
   const [q, setQ] = useState("");
   const [cat, setCat] = useState("");
   const [editing, setEditing] = useState(null);
+  const [managing, setManaging] = useState(false);
+  const [newCat, setNewCat] = useState("");
+  const [newType, setNewType] = useState("");
+  const [typeErr, setTypeErr] = useState("");
+  const [autoTagging, setAutoTagging] = useState(false);
+  const [autoTagMsg, setAutoTagMsg] = useState("");
   const shown = data.exercises.filter(
     (e) => (!cat || e.categories.includes(cat)) && (!q || (e.name + " " + e.desc + " " + e.categories.join(" ")).toLowerCase().includes(q.toLowerCase()))
   );
@@ -815,13 +857,151 @@ function ExerciseBank({ data, update, isCoach }) {
     setEditing(null);
   };
   const remove = (id) => update({ exercises: data.exercises.filter((e) => e.id !== id) });
-  if (editing) return /* @__PURE__ */ React.createElement(ExerciseEditor, { exercise: editing, onSave: save, onCancel: () => setEditing(null) });
-  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head standalone" }, /* @__PURE__ */ React.createElement("h2", null, "Exercise bank"), isCoach && /* @__PURE__ */ React.createElement("button", { className: "bth-btn", onClick: () => setEditing({ id: uid(), name: "", type: SESSION_TYPES[0], categories: [], desc: "" }) }, "\uFF0B Add exercise")), /* @__PURE__ */ React.createElement("input", { className: "bth-search", placeholder: "Search exercises\u2026", value: q, onChange: (e) => setQ(e.target.value) }), /* @__PURE__ */ React.createElement("div", { className: "bth-catrow" }, /* @__PURE__ */ React.createElement("button", { className: "bth-cat" + (!cat ? " on" : ""), onClick: () => setCat("") }, "All"), CATEGORIES.map((c) => /* @__PURE__ */ React.createElement("button", { key: c, className: "bth-cat" + (cat === c ? " on" : ""), onClick: () => setCat(cat === c ? "" : c) }, c))), /* @__PURE__ */ React.createElement("div", { className: "bth-exgrid" }, shown.map((ex) => /* @__PURE__ */ React.createElement("div", { key: ex.id, className: "bth-excard" }, /* @__PURE__ */ React.createElement("div", { className: "bth-ex-type" }, TYPE_SHORT[ex.type]), /* @__PURE__ */ React.createElement("h3", null, ex.name), /* @__PURE__ */ React.createElement("p", null, ex.desc), /* @__PURE__ */ React.createElement("div", { className: "bth-ex-tags" }, ex.categories.map((c) => /* @__PURE__ */ React.createElement("span", { key: c }, c))), isCoach && /* @__PURE__ */ React.createElement("div", { className: "bth-ex-actions" }, /* @__PURE__ */ React.createElement("button", { className: "bth-btn small ghost", onClick: () => setEditing({ ...ex }) }, "Edit"), /* @__PURE__ */ React.createElement("button", { className: "bth-btn small danger", onClick: () => remove(ex.id) }, "Delete")))), shown.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "bth-empty" }, "No exercises match. Add one \u2014 the bank grows as you go.")));
+  const addCategory = (name) => {
+    const n = name.trim();
+    if (!n || data.categories.some((c) => c.toLowerCase() === n.toLowerCase())) return;
+    update({ categories: [...data.categories, n] });
+  };
+  const removeCategory = (name) => {
+    update({
+      categories: data.categories.filter((c) => c !== name),
+      exercises: data.exercises.map((e) => ({ ...e, categories: e.categories.filter((c) => c !== name) }))
+    });
+    if (cat === name) setCat("");
+  };
+  const addType = (name) => {
+    const n = name.trim();
+    setTypeErr("");
+    if (!n) return;
+    if (n === "Mixed") {
+      setTypeErr(`"Mixed" is reserved for sessions and can't be used here.`);
+      return;
+    }
+    if (data.types.some((t) => t.toLowerCase() === n.toLowerCase())) {
+      setTypeErr("That type already exists.");
+      return;
+    }
+    update({ types: [...data.types, n] });
+    setNewType("");
+  };
+  const removeType = (name) => {
+    const inUse = data.exercises.filter((e) => e.type === name).length;
+    if (inUse > 0) {
+      setTypeErr(`Can't remove \u2014 ${inUse} exercise${inUse === 1 ? "" : "s"} still use${inUse === 1 ? "s" : ""} "${name}". Reassign them first.`);
+      return;
+    }
+    setTypeErr("");
+    update({ types: data.types.filter((t) => t !== name) });
+  };
+  const untagged = data.exercises.filter((e) => !e.categories || e.categories.length === 0);
+  const autoTag = async () => {
+    if (!untagged.length) return;
+    setAutoTagging(true);
+    setAutoTagMsg("");
+    const list = untagged.map((e) => `${e.id}|${e.name}|${e.type}|${e.desc || ""}`).join("\n");
+    const prompt = `Assign badminton training keyword categories to each exercise below, using ONLY this list of available categories: ${JSON.stringify(data.categories)}.
+Each exercise line is id|name|type|description. Pick 1-3 categories per exercise that best match its name/type/description.
+Exercises:
+${list}
+Respond with ONLY compact JSON, no commentary: {"assignments":[{"id":"<id>","categories":["...", ...]}]}`;
+    try {
+      const { text } = await callClaude(prompt);
+      const parsed = parseJsonLoose(text);
+      const byId = {};
+      (parsed.assignments || []).forEach((a) => {
+        if (a && a.id) byId[a.id] = (a.categories || []).filter((c) => data.categories.includes(c));
+      });
+      let count = 0;
+      const exercises = data.exercises.map((e) => {
+        if (byId[e.id] && byId[e.id].length) {
+          count++;
+          return { ...e, categories: byId[e.id] };
+        }
+        return e;
+      });
+      update({ exercises });
+      setAutoTagMsg(`\u2713 Tagged ${count} of ${untagged.length} exercises`);
+    } catch (e) {
+      setAutoTagMsg("\u2717 " + e.message);
+    } finally {
+      setAutoTagging(false);
+    }
+  };
+  if (editing) {
+    return /* @__PURE__ */ React.createElement(
+      ExerciseEditor,
+      {
+        exercise: editing,
+        types: data.types,
+        categories: data.categories,
+        onAddCategory: addCategory,
+        onSave: save,
+        onCancel: () => setEditing(null)
+      }
+    );
+  }
+  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head standalone" }, /* @__PURE__ */ React.createElement("h2", null, "Exercise bank"), isCoach && /* @__PURE__ */ React.createElement("button", { className: "bth-btn", onClick: () => setEditing({ id: uid(), name: "", type: data.types[0], categories: [], desc: "" }) }, "\uFF0B Add exercise")), isCoach && /* @__PURE__ */ React.createElement("div", { className: "bth-managepanel" }, /* @__PURE__ */ React.createElement("button", { className: "bth-linkbtn", onClick: () => setManaging((m) => !m) }, managing ? "Hide" : "Manage", " types & keywords"), managing && /* @__PURE__ */ React.createElement("div", { className: "bth-manageblock" }, /* @__PURE__ */ React.createElement("div", { className: "bth-manage-col" }, /* @__PURE__ */ React.createElement("strong", null, "Types"), /* @__PURE__ */ React.createElement("div", { className: "bth-managetags" }, data.types.map((t) => /* @__PURE__ */ React.createElement("span", { key: t, className: "bth-managetag" }, t, /* @__PURE__ */ React.createElement("button", { onClick: () => removeType(t), "aria-label": "Remove " + t }, "\u2715")))), /* @__PURE__ */ React.createElement("div", { className: "bth-manageadd" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: newType,
+      placeholder: "New type name",
+      onChange: (e) => setNewType(e.target.value),
+      onKeyDown: (e) => e.key === "Enter" && addType(newType)
+    }
+  ), /* @__PURE__ */ React.createElement("button", { className: "bth-btn small", onClick: () => addType(newType) }, "Add"))), /* @__PURE__ */ React.createElement("div", { className: "bth-manage-col" }, /* @__PURE__ */ React.createElement("strong", null, "Keywords"), /* @__PURE__ */ React.createElement("div", { className: "bth-managetags" }, data.categories.map((c) => /* @__PURE__ */ React.createElement("span", { key: c, className: "bth-managetag" }, c, /* @__PURE__ */ React.createElement("button", { onClick: () => removeCategory(c), "aria-label": "Remove " + c }, "\u2715")))), /* @__PURE__ */ React.createElement("div", { className: "bth-manageadd" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: newCat,
+      placeholder: "New keyword",
+      onChange: (e) => setNewCat(e.target.value),
+      onKeyDown: (e) => {
+        if (e.key === "Enter") {
+          addCategory(newCat);
+          setNewCat("");
+        }
+      }
+    }
+  ), /* @__PURE__ */ React.createElement("button", { className: "bth-btn small", onClick: () => {
+    addCategory(newCat);
+    setNewCat("");
+  } }, "Add"))), typeErr && /* @__PURE__ */ React.createElement("p", { className: "bth-error" }, typeErr), untagged.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "bth-autotag" }, /* @__PURE__ */ React.createElement("button", { className: "bth-btn small ghost", disabled: autoTagging, onClick: autoTag }, autoTagging ? "Tagging\u2026" : `\u2728 Auto-tag ${untagged.length} untagged exercise${untagged.length === 1 ? "" : "s"}`), autoTagMsg && /* @__PURE__ */ React.createElement("span", { className: "bth-autotag-msg" }, " ", autoTagMsg)))), /* @__PURE__ */ React.createElement("input", { className: "bth-search", placeholder: "Search exercises\u2026", value: q, onChange: (e) => setQ(e.target.value) }), /* @__PURE__ */ React.createElement("div", { className: "bth-catrow" }, /* @__PURE__ */ React.createElement("button", { className: "bth-cat" + (!cat ? " on" : ""), onClick: () => setCat("") }, "All"), data.categories.map((c) => /* @__PURE__ */ React.createElement("button", { key: c, className: "bth-cat" + (cat === c ? " on" : ""), onClick: () => setCat(cat === c ? "" : c) }, c))), /* @__PURE__ */ React.createElement("div", { className: "bth-exgrid" }, shown.map((ex) => /* @__PURE__ */ React.createElement("div", { key: ex.id, className: "bth-excard" }, /* @__PURE__ */ React.createElement("div", { className: "bth-ex-type" }, shortLabel(ex.type)), /* @__PURE__ */ React.createElement("h3", null, ex.name), /* @__PURE__ */ React.createElement("p", null, ex.desc), /* @__PURE__ */ React.createElement("div", { className: "bth-ex-tags" }, ex.categories.map((c) => /* @__PURE__ */ React.createElement("span", { key: c }, c))), isCoach && /* @__PURE__ */ React.createElement("div", { className: "bth-ex-actions" }, /* @__PURE__ */ React.createElement("button", { className: "bth-btn small ghost", onClick: () => setEditing({ ...ex }) }, "Edit"), /* @__PURE__ */ React.createElement("button", { className: "bth-btn small danger", onClick: () => remove(ex.id) }, "Delete")))), shown.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "bth-empty" }, "No exercises match. Add one \u2014 the bank grows as you go.")));
 }
-function ExerciseEditor({ exercise, onSave, onCancel }) {
+function ExerciseEditor({ exercise, types, categories, onAddCategory, onSave, onCancel }) {
   const [ex, setEx] = useState(exercise);
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestErr, setSuggestErr] = useState("");
   const toggleCat = (c) => setEx((x) => ({ ...x, categories: x.categories.includes(c) ? x.categories.filter((y) => y !== c) : [...x.categories, c] }));
-  return /* @__PURE__ */ React.createElement("div", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, exercise.name ? "Edit exercise" : "New exercise")), /* @__PURE__ */ React.createElement("div", { className: "bth-formgrid" }, /* @__PURE__ */ React.createElement("label", null, "Name", /* @__PURE__ */ React.createElement("input", { value: ex.name, placeholder: "e.g. Multi-shuttle smash defense", onChange: (e) => setEx({ ...ex, name: e.target.value }) })), /* @__PURE__ */ React.createElement("label", null, "Type", /* @__PURE__ */ React.createElement("select", { value: ex.type, onChange: (e) => setEx({ ...ex, type: e.target.value }) }, SESSION_TYPES.filter((t) => t !== "Mixed").map((t) => /* @__PURE__ */ React.createElement("option", { key: t }, t))))), /* @__PURE__ */ React.createElement("div", { className: "bth-field" }, /* @__PURE__ */ React.createElement("span", { className: "bth-fieldlabel" }, "Keywords"), /* @__PURE__ */ React.createElement("div", { className: "bth-catrow wrap" }, CATEGORIES.map((c) => /* @__PURE__ */ React.createElement("button", { key: c, className: "bth-cat" + (ex.categories.includes(c) ? " on" : ""), onClick: () => toggleCat(c) }, c)))), /* @__PURE__ */ React.createElement("label", { className: "bth-field" }, "How it works", /* @__PURE__ */ React.createElement("textarea", { rows: 3, value: ex.desc, placeholder: "Sets, reps, feeds, coaching points\u2026", onChange: (e) => setEx({ ...ex, desc: e.target.value }) })), /* @__PURE__ */ React.createElement("div", { className: "bth-editactions" }, /* @__PURE__ */ React.createElement("button", { className: "bth-btn ghost", onClick: onCancel }, "Cancel"), /* @__PURE__ */ React.createElement("button", { className: "bth-btn", disabled: !ex.name.trim(), onClick: () => onSave(ex) }, "Save exercise")));
+  const suggestKeywords = async () => {
+    if (!ex.name.trim()) {
+      setSuggestErr("Add a name first.");
+      return;
+    }
+    setSuggesting(true);
+    setSuggestErr("");
+    const prompt = `Pick badminton training keyword categories for this exercise, using ONLY this list: ${JSON.stringify(categories)}.
+Name: "${ex.name}"
+Type: "${ex.type}"
+Description: "${ex.desc || ""}"
+Pick 1-3 that best fit. If none fit well, you may also propose ONE new short category (2-4 words).
+Respond with ONLY JSON: {"categories":["..."],"newCategory":string_or_null}`;
+    try {
+      const { text } = await callClaude(prompt);
+      const parsed = parseJsonLoose(text);
+      let picked = (parsed.categories || []).filter((c) => categories.includes(c));
+      if (parsed.newCategory && parsed.newCategory.trim()) {
+        const nc = parsed.newCategory.trim();
+        if (!categories.includes(nc)) onAddCategory(nc);
+        picked = [...picked, nc];
+      }
+      if (!picked.length) throw new Error("no matching categories suggested");
+      setEx((x) => ({ ...x, categories: [...new Set(picked)] }));
+    } catch (e) {
+      setSuggestErr("Couldn't suggest keywords: " + e.message);
+    } finally {
+      setSuggesting(false);
+    }
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, exercise.name ? "Edit exercise" : "New exercise")), /* @__PURE__ */ React.createElement("div", { className: "bth-formgrid" }, /* @__PURE__ */ React.createElement("label", null, "Name", /* @__PURE__ */ React.createElement("input", { value: ex.name, placeholder: "e.g. Multi-shuttle smash defense", onChange: (e) => setEx({ ...ex, name: e.target.value }) })), /* @__PURE__ */ React.createElement("label", null, "Type", /* @__PURE__ */ React.createElement("select", { value: ex.type, onChange: (e) => setEx({ ...ex, type: e.target.value }) }, types.map((t) => /* @__PURE__ */ React.createElement("option", { key: t }, t))))), /* @__PURE__ */ React.createElement("div", { className: "bth-field" }, /* @__PURE__ */ React.createElement("span", { className: "bth-fieldlabel" }, "Keywords", /* @__PURE__ */ React.createElement("button", { className: "bth-linkbtn suggestbtn", disabled: suggesting, onClick: suggestKeywords }, suggesting ? "Thinking\u2026" : "\u2728 Suggest from description")), suggestErr && /* @__PURE__ */ React.createElement("p", { className: "bth-error" }, suggestErr), /* @__PURE__ */ React.createElement("div", { className: "bth-catrow wrap" }, categories.map((c) => /* @__PURE__ */ React.createElement("button", { key: c, className: "bth-cat" + (ex.categories.includes(c) ? " on" : ""), onClick: () => toggleCat(c) }, c)))), /* @__PURE__ */ React.createElement("label", { className: "bth-field" }, "How it works", /* @__PURE__ */ React.createElement("textarea", { rows: 3, value: ex.desc, placeholder: "Sets, reps, feeds, coaching points\u2026", onChange: (e) => setEx({ ...ex, desc: e.target.value }) })), /* @__PURE__ */ React.createElement("div", { className: "bth-editactions" }, /* @__PURE__ */ React.createElement("button", { className: "bth-btn ghost", onClick: onCancel }, "Cancel"), /* @__PURE__ */ React.createElement("button", { className: "bth-btn", disabled: !ex.name.trim(), onClick: () => onSave(ex) }, "Save exercise")));
 }
 function AICoach({ data, update, goTo }) {
   const [focus, setFocus] = useState("");
@@ -848,8 +1028,9 @@ function AICoach({ data, update, goTo }) {
     setError("");
     setPlan(null);
     const d2 = daysUntil(data.tournament.date);
-    const recent = [...data.sessions].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6).map((s) => `${s.date} ${s.status} ${TYPE_SHORT[s.type] || s.type} ${s.duration}m: ${s.blocks.map((b) => b.name).join(", ") || "-"}`);
-    const bank = data.exercises.map((e) => `${e.id}|${e.name}|${TYPE_SHORT[e.type] || e.type}|${(e.categories || []).join(",")}`).join("\n");
+    const allTypes = [...data.types, "Mixed"];
+    const recent = [...data.sessions].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6).map((s) => `${s.date} ${s.status} ${shortLabel(s.type)} ${s.duration}m: ${s.blocks.map((b) => b.name).join(", ") || "-"}`);
+    const bank = data.exercises.map((e) => `${e.id}|${e.name}|${shortLabel(e.type)}|${(e.categories || []).join(",")}`).join("\n");
     const names = playerIds.map((id) => data.players.find((p) => p.id === id)?.name).join(" and ");
     const prompt = `You are a youth badminton coach planning ONE training session for ${names || "two junior players"}.
 
@@ -863,7 +1044,7 @@ Context:
 ${bank}
 
 Respond with ONLY a JSON object, no markdown fences, no commentary:
-{"title": string, "type": one of ${JSON.stringify(SESSION_TYPES)}, "rationale": string (max 35 words, aimed at the parent-coach, mention tournament timing), "blocks": [{"exerciseId": string or null, "name": string, "minutes": number, "coachNotes": string (max 12 words)}]}
+{"title": string, "type": one of ${JSON.stringify(allTypes)}, "rationale": string (max 35 words, aimed at the parent-coach, mention tournament timing), "blocks": [{"exerciseId": string or null, "name": string, "minutes": number, "coachNotes": string (max 12 words)}]}
 Blocks must sum to ${duration} minutes. Use 4-6 blocks. Keep every string short. If a needed exercise isn't in the bank, set exerciseId to null and invent it with a clear name.`;
     try {
       const { text, truncated } = await callClaude(prompt);
@@ -882,7 +1063,7 @@ Blocks must sum to ${duration} minutes. Use 4-6 blocks. Keep every string short.
     const blocks = plan.blocks.map((b) => {
       let exId = b.exerciseId && data.exercises.some((e) => e.id === b.exerciseId) ? b.exerciseId : null;
       if (!exId) {
-        const ex = { id: uid(), name: b.name, type: plan.type === "Mixed" ? "Footwork drills" : plan.type, categories: [], desc: b.coachNotes || "" };
+        const ex = { id: uid(), name: b.name, type: plan.type === "Mixed" ? data.types[0] || "Mixed" : plan.type, categories: [], desc: b.coachNotes || "" };
         newExercises.push(ex);
         exId = ex.id;
       }
@@ -892,7 +1073,7 @@ Blocks must sum to ${duration} minutes. Use 4-6 blocks. Keep every string short.
       id: uid(),
       date: todayStr(),
       title: plan.title,
-      type: SESSION_TYPES.includes(plan.type) ? plan.type : "Mixed",
+      type: [...data.types, "Mixed"].includes(plan.type) ? plan.type : "Mixed",
       playerIds,
       duration,
       blocks,
@@ -954,8 +1135,9 @@ function ProgramBuilder({ data, update, goTo, playerIds, togglePlayer }) {
     setProgram(null);
     setProgressMsg("");
     const total = onCourt + offCourt;
+    const allTypes = [...data.types, "Mixed"];
     const names = playerIds.map((id) => data.players.find((p) => p.id === id)?.name).join(" and ");
-    const bank = data.exercises.map((e) => `${e.id}|${e.name}|${TYPE_SHORT[e.type] || e.type}|${(e.categories || []).join(",")}`).join("\n");
+    const bank = data.exercises.map((e) => `${e.id}|${e.name}|${shortLabel(e.type)}|${(e.categories || []).join(",")}`).join("\n");
     const chunk = Math.max(1, Math.min(3, Math.floor(12 / Math.max(1, total))));
     const buildPrompt = (start, end, existing) => {
       const prior = existing && existing.weeks.length ? `Program title: "${existing.title}". Weeks already planned (week:theme): ${existing.weeks.map((w) => `${w.n}:${w.theme}`).join("; ")}. Continue the same program consistently without repeating identical sessions.` : "";
@@ -969,7 +1151,7 @@ Sessions are 30-180 minutes (multiples of 15; runs may be short, court sessions 
 Exercise bank, one per line as id|name|type|keywords \u2014 strongly prefer these, reference by id:
 ${bank}
 Respond with ONLY compact JSON, no markdown fences, no commentary, minimal whitespace:
-${shape} where weeks = [{"n":${start},"theme":str (3-4 words),"sessions":[{"day":"MO"|"TU"|"WE"|"TH"|"FR"|"SA"|"SU","title":str,"type":one of ${JSON.stringify(SESSION_TYPES)},"minutes":num,"blocks":[["<exerciseId from bank, or a new drill name>",minutes],...]}]}]
+${shape} where weeks = [{"n":${start},"theme":str (3-4 words),"sessions":[{"day":"MO"|"TU"|"WE"|"TH"|"FR"|"SA"|"SU","title":str,"type":one of ${JSON.stringify(allTypes)},"minutes":num,"blocks":[["<exerciseId from bank, or a new drill name>",minutes],...]}]}]
 Exactly ${onCourt} on-court and ${offCourt} off-court sessions per week, ${total >= 5 ? "exactly 2" : "2-3"} blocks per session (a single run may be 1 block), block minutes sum to session minutes. Keep every string short.`;
     };
     let all = null;
@@ -1002,6 +1184,7 @@ Exactly ${onCourt} on-court and ${offCourt} off-court sessions per week, ${total
     const base = weekStart(/* @__PURE__ */ new Date());
     const today = /* @__PURE__ */ new Date();
     today.setHours(0, 0, 0, 0);
+    const allTypes = [...data.types, "Mixed"];
     const newExercises = [];
     const newSessions = [];
     program.weeks.forEach((w) => (w.sessions || []).forEach((ses) => {
@@ -1014,7 +1197,7 @@ Exactly ${onCourt} on-court and ${offCourt} off-court sessions per week, ${total
           ex = {
             id: uid(),
             name: String(ref),
-            type: SESSION_TYPES.includes(ses.type) && ses.type !== "Mixed" ? ses.type : "Footwork drills",
+            type: data.types.includes(ses.type) ? ses.type : data.types[0] || "Footwork drills",
             categories: [],
             desc: ""
           };
@@ -1026,7 +1209,7 @@ Exactly ${onCourt} on-court and ${offCourt} off-court sessions per week, ${total
         id: uid(),
         date: localISO(dt),
         title: ses.title || `${w.theme || "Training"} session`,
-        type: SESSION_TYPES.includes(ses.type) ? ses.type : "Mixed",
+        type: allTypes.includes(ses.type) ? ses.type : "Mixed",
         playerIds,
         duration: Math.min(180, Math.max(30, Math.round(ses.minutes) || 90)),
         blocks,
@@ -1055,7 +1238,7 @@ Exactly ${onCourt} on-court and ${offCourt} off-court sessions per week, ${total
     },
     /* @__PURE__ */ React.createElement("span", { className: "dot", style: { background: p.color } }),
     p.name
-  )))), /* @__PURE__ */ React.createElement("button", { className: "bth-btn big", disabled: loading || playerIds.length === 0 || onCourt + offCourt === 0, onClick: generate }, loading ? progressMsg || "Building the program\u2026" : `Build ${weeks}-week program`), error && /* @__PURE__ */ React.createElement("p", { className: "bth-error" }, error), program && /* @__PURE__ */ React.createElement("div", { className: "bth-plan" }, /* @__PURE__ */ React.createElement("h3", null, program.title), /* @__PURE__ */ React.createElement("p", { className: "bth-plan-rationale" }, program.overview), program.weeks.map((w) => /* @__PURE__ */ React.createElement("div", { key: w.n, className: "bth-progweek" }, /* @__PURE__ */ React.createElement("h4", null, "Week ", w.n, " \u2014 ", w.theme), (w.sessions || []).map((ses, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "bth-progsession" }, /* @__PURE__ */ React.createElement("span", { className: "bth-progday" }, DAY_NAME[ses.day] || ses.day), /* @__PURE__ */ React.createElement("strong", null, ses.title), /* @__PURE__ */ React.createElement("span", { className: "bth-sr-meta" }, TYPE_SHORT[ses.type] || ses.type, " \xB7 ", ses.minutes, " min"), /* @__PURE__ */ React.createElement("span", { className: "bth-sr-blocks" }, (ses.blocks || []).map(([ref, min], j) => {
+  )))), /* @__PURE__ */ React.createElement("button", { className: "bth-btn big", disabled: loading || playerIds.length === 0 || onCourt + offCourt === 0, onClick: generate }, loading ? progressMsg || "Building the program\u2026" : `Build ${weeks}-week program`), error && /* @__PURE__ */ React.createElement("p", { className: "bth-error" }, error), program && /* @__PURE__ */ React.createElement("div", { className: "bth-plan" }, /* @__PURE__ */ React.createElement("h3", null, program.title), /* @__PURE__ */ React.createElement("p", { className: "bth-plan-rationale" }, program.overview), program.weeks.map((w) => /* @__PURE__ */ React.createElement("div", { key: w.n, className: "bth-progweek" }, /* @__PURE__ */ React.createElement("h4", null, "Week ", w.n, " \u2014 ", w.theme), (w.sessions || []).map((ses, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "bth-progsession" }, /* @__PURE__ */ React.createElement("span", { className: "bth-progday" }, DAY_NAME[ses.day] || ses.day), /* @__PURE__ */ React.createElement("strong", null, ses.title), /* @__PURE__ */ React.createElement("span", { className: "bth-sr-meta" }, shortLabel(ses.type), " \xB7 ", ses.minutes, " min"), /* @__PURE__ */ React.createElement("span", { className: "bth-sr-blocks" }, (ses.blocks || []).map(([ref, min], j) => {
     const ex = data.exercises.find((e) => e.id === ref);
     return /* @__PURE__ */ React.createElement("span", { key: j, className: "bth-block-pill" }, ex ? ex.name : String(ref), " ", /* @__PURE__ */ React.createElement("em", null, min, "m"));
   })))))), /* @__PURE__ */ React.createElement("div", { className: "bth-editactions" }, /* @__PURE__ */ React.createElement("button", { className: "bth-btn ghost", onClick: generate }, "Redraft"), /* @__PURE__ */ React.createElement("button", { className: "bth-btn", onClick: saveProgram }, "Save all as planned sessions"))));
@@ -1118,7 +1301,7 @@ function Progress({ data, meId }) {
   }, [data.sessions, playerId]);
   const variety = catMin.length;
   const encouragement = done.length === 0 ? "Log a completed session and the charts light up." : variety >= 6 ? `Great variety \u2014 ${variety} different areas trained. That's how all-round players are built.` : variety >= 3 ? "Solid base. Try mixing in one category you haven't touched lately." : "Heavy focus on a few areas \u2014 deliberate specialization or time to vary it up?";
-  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head standalone" }, /* @__PURE__ */ React.createElement("h2", null, "Progress"), /* @__PURE__ */ React.createElement("div", null, ["week", "month"].map((r) => /* @__PURE__ */ React.createElement("button", { key: r, className: "bth-tab mini" + (range === r ? " active" : ""), onClick: () => setRange(r) }, r === "week" ? "This week" : "This month")), /* @__PURE__ */ React.createElement("select", { className: "bth-playersel", value: playerId, onChange: (e) => setPlayerId(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "all" }, "Both players"), data.players.map((p) => /* @__PURE__ */ React.createElement("option", { key: p.id, value: p.id }, p.name))))), /* @__PURE__ */ React.createElement("div", { className: "bth-statrow" }, /* @__PURE__ */ React.createElement(StatCard, { label: "Sessions completed", value: done.length, sub: range === "week" ? "this week" : "this month" }), /* @__PURE__ */ React.createElement(StatCard, { label: "Training time", value: totalMin >= 60 ? (totalMin / 60).toFixed(1) + "h" : totalMin + "m", sub: "completed only" }), /* @__PURE__ */ React.createElement(StatCard, { label: "Areas trained", value: variety, sub: `of ${CATEGORIES.length} categories` }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg effort", value: avgEffort, sub: "\u{1F3F8} 1\u20135 scale" })), /* @__PURE__ */ React.createElement("p", { className: "bth-encourage" }, encouragement), /* @__PURE__ */ React.createElement("section", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, "Where the minutes went")), catMin.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "bth-empty" }, "No completed session blocks in this range yet.") : /* @__PURE__ */ React.createElement(MiniBarChart, { data: catMin })), /* @__PURE__ */ React.createElement("section", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, "Weekly hours \u2014 last 8 weeks")), /* @__PURE__ */ React.createElement(MiniLineChart, { data: trend })));
+  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head standalone" }, /* @__PURE__ */ React.createElement("h2", null, "Progress"), /* @__PURE__ */ React.createElement("div", null, ["week", "month"].map((r) => /* @__PURE__ */ React.createElement("button", { key: r, className: "bth-tab mini" + (range === r ? " active" : ""), onClick: () => setRange(r) }, r === "week" ? "This week" : "This month")), /* @__PURE__ */ React.createElement("select", { className: "bth-playersel", value: playerId, onChange: (e) => setPlayerId(e.target.value) }, /* @__PURE__ */ React.createElement("option", { value: "all" }, "Both players"), data.players.map((p) => /* @__PURE__ */ React.createElement("option", { key: p.id, value: p.id }, p.name))))), /* @__PURE__ */ React.createElement("div", { className: "bth-statrow" }, /* @__PURE__ */ React.createElement(StatCard, { label: "Sessions completed", value: done.length, sub: range === "week" ? "this week" : "this month" }), /* @__PURE__ */ React.createElement(StatCard, { label: "Training time", value: totalMin >= 60 ? (totalMin / 60).toFixed(1) + "h" : totalMin + "m", sub: "completed only" }), /* @__PURE__ */ React.createElement(StatCard, { label: "Areas trained", value: variety, sub: `of ${data.categories.length} categories` }), /* @__PURE__ */ React.createElement(StatCard, { label: "Avg effort", value: avgEffort, sub: "\u{1F3F8} 1\u20135 scale" })), /* @__PURE__ */ React.createElement("p", { className: "bth-encourage" }, encouragement), /* @__PURE__ */ React.createElement("section", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, "Where the minutes went")), catMin.length === 0 ? /* @__PURE__ */ React.createElement("p", { className: "bth-empty" }, "No completed session blocks in this range yet.") : /* @__PURE__ */ React.createElement(MiniBarChart, { data: catMin })), /* @__PURE__ */ React.createElement("section", { className: "bth-panel" }, /* @__PURE__ */ React.createElement("div", { className: "bth-panel-head" }, /* @__PURE__ */ React.createElement("h2", null, "Weekly hours \u2014 last 8 weeks")), /* @__PURE__ */ React.createElement(MiniLineChart, { data: trend })));
 }
 function StyleBlock() {
   return /* @__PURE__ */ React.createElement("style", null, `
@@ -1156,6 +1339,13 @@ function StyleBlock() {
       .bth-chip.editing input { background: transparent; border: none; color: inherit; font: inherit; width: 110px; outline: none; border-bottom: 1px solid rgba(255,255,255,0.6); }
       .bth-chip.editing { flex-wrap: wrap; }
       .bth-swatches { display: flex; gap: 5px; align-items: center; margin-left: 6px; }
+      .bth-chip.addplayer { border-style: dashed; opacity: 0.85; }
+      .bth-chip.addplayer:hover { opacity: 1; }
+      .bth-chip-remove {
+        background: rgba(255,255,255,0.2); border: none; color: #fff; border-radius: 50%;
+        width: 18px; height: 18px; line-height: 18px; font-size: 11px; cursor: pointer; margin-left: 4px; padding: 0;
+      }
+      .bth-chip-remove:hover { background: var(--smash); }
       .bth-swatch { width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.6); cursor: pointer; padding: 0; outline-offset: 1px; }
       .bth-chip.select { border-color: var(--line); background: #fff; color: var(--ink); opacity: 0.55; }
       .bth-chip.select.on { opacity: 1; background: #fff; }
@@ -1172,7 +1362,13 @@ function StyleBlock() {
       .bth-count-empty { font-weight: 600; }
       .bth-tourney-edit { display: flex; flex-direction: column; gap: 6px; }
       .bth-tourney-edit input { border: none; border-radius: 6px; padding: 6px 8px; font: inherit; }
-      .bth-save { position: absolute; right: 12px; top: 8px; font-size: 11px; opacity: 0.8; text-align: right; max-width: 60%; }
+      .bth-syncrow { display: flex; justify-content: flex-end; align-items: center; gap: 10px; padding: 6px 20px 4px; flex-wrap: wrap; }
+      .bth-syncbtn {
+        font: inherit; font-size: 12px; font-weight: 600; color: #fff; background: rgba(255,255,255,0.15);
+        border: 1px solid rgba(255,255,255,0.4); border-radius: 999px; padding: 3px 10px; cursor: pointer;
+      }
+      .bth-syncbtn:hover { background: rgba(255,255,255,0.28); }
+      .bth-save { font-size: 11px; opacity: 0.85; text-align: right; }
       .bth-savehelp {
         position: relative; z-index: 2; background: var(--smash); color: #fff; font-size: 13px;
         padding: 8px 20px; text-align: center;
@@ -1258,7 +1454,7 @@ function StyleBlock() {
       }
       .bth-root input[type=range] { accent-color: var(--court); }
       .bth-field { margin-bottom: 14px; display: block; }
-      .bth-fieldlabel { display: block; font-weight: 600; font-size: 13.5px; margin-bottom: 6px; }
+      .bth-fieldlabel { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-weight: 600; font-size: 13.5px; margin-bottom: 6px; }
       .bth-warn { color: var(--smash); font-style: normal; }
       .bth-blockrow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 14px; }
       .bth-blockname { flex: 1; font-weight: 500; }
@@ -1272,6 +1468,18 @@ function StyleBlock() {
       /* Exercise bank */
       .bth-search { width: 100%; margin-bottom: 10px; }
       .bth-catrow { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 8px; margin-bottom: 12px; }
+      .bth-managepanel { margin-bottom: 12px; }
+      .bth-manageblock { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-top: 8px; }
+      .bth-manage-col strong { display: block; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 8px; }
+      .bth-managetags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+      .bth-managetag { display: inline-flex; align-items: center; gap: 6px; background: #fff; border: 1px solid var(--line); border-radius: 999px; padding: 3px 6px 3px 11px; font-size: 12.5px; }
+      .bth-managetag button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 11px; padding: 2px; border-radius: 50%; }
+      .bth-managetag button:hover { color: var(--smash); background: #fbe8e2; }
+      .bth-manageadd { display: flex; gap: 6px; }
+      .bth-manageadd input { flex: 1; font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+      .bth-manageblock > .bth-error { grid-column: 1 / -1; margin: 0; }
+      .bth-autotag { grid-column: 1 / -1; border-top: 1px dashed var(--line); padding-top: 10px; }
+      .bth-autotag-msg { font-size: 13px; color: var(--muted); }
       .bth-catrow.wrap { flex-wrap: wrap; overflow: visible; }
       .bth-cat {
         font: inherit; font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer;
